@@ -2365,12 +2365,7 @@ grassfunc <- function(x){
   #### no wait - the "scdb" dataset has got "blk" id values so there shouldn't be any NA instances here....
   
   
-  
-  
-  
-  
-  
-  
+
   ### perform raster extract operation using these points and a raster version of FLS open habitat dataset cropped to the current scdb block boundary.
   
   ## Importing FLS open habitats polygon dataset
@@ -2591,6 +2586,25 @@ grassfunc <- function(x){
 
 
 ```
+
+```{r echo = F, eval = T, warning = F, fig.cap = "Grassland microhabitats - A) Grassland, B) Grassland mosaics", fig.show = "hold", out.width="55%"}
+
+grass <- as.data.frame(readRDS("./Markdown/Phase2/grasshabs.RData"))
+
+grass1 <- grass %>% filter(Grassland == 1)
+grass2 <- grass %>% filter(Grassland_mos ==1)
+
+scdbgrass1 <- scdb %>% inner_join(grass1, by = "SCOBJECTID")
+scdbgrass2 <- scdb %>% inner_join(grass2, by = "SCOBJECTID")
+
+plot(st_geometry(scdb))
+plot(st_geometry(scdbgrass1), col="red", add=TRUE)
+
+plot(st_geometry(scdb))
+plot(st_geometry(scdbgrass2), col="red", add=TRUE)
+
+```
+
 
 ## Stage 3.12 - Assigning woodland types to open structure types ----
 
