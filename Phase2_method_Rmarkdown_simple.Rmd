@@ -1,0 +1,2709 @@
+---
+title: "WdbioD_Phase2_method"
+author: "AndrewR"
+date: "18/05/2021"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(fig.align = "center", echo=FALSE, eval=TRUE, warning=FALSE,message=FALSE)
+
+knitr::opts_knit$set(root.dir = '../../../..')
+
+```
+
+### Phase 2 methodology
+
+## Stage 1 - Woodland types
+
+We assigned one of x Forest Development Types to each sub-compartment based on a series of rulesets developed by Alice Broome.  This classification process used criteria such as the tree species recorded in each component, whether a site was lowland or upland, and whether a stand was dominated by single species or mixtures.  Any stand which didn't fully satisfy the criteria for the FDT classes was instead assigned a generic version of an FDT class based on the dominant tree species present.  In this manner you could pick up areas of "G2" generic woodland comprised of a dominance of a given target species but because of the presence of other species or if the site is lowland instead of upland, the site can't be classified as G2 so instead is allocated the generic class.
+
+## Stage 2 - Open structure types
+
+In the main woodland biodiversity work (Phase 1) we worked with a subset of the original sub-compartment dataset comprised of those stands with at least one component associated with woodland habitat.  This meant that all sub-compartments with no woodland component as well as those which don't have a corresponding entry in a component table, were left out of the analysis.  For the Phase 2 work, however, we wish to include these more open sub-compartments; namely the "temporary" and "permanent" open structure types.  To do this we first use the component table to pick out components which satisfy criteria for the temporary open type.
+
+For the temporary open structure type we look for component rows with "luse" field entry of "PFE" which denotes felling and of this subset we then select for those which have been felled in the last five years.
+
+
+```{r eval=T, echo=F, message=FALSE, warning=FALSE, results="hide"}
+
+print((getwd()))
+
+library(sf)
+library(dplyr)
+library(raster)
+library(fasterize)
+library(pryr)
+library(stringr)
+
+## FLS region
+
+a <- 1
+
+setwd("C:/Users/44754/Documents/R/FR_work/FLS_bio_indicator/fls_wd_biodiversity_indicator/FLS_bioD_indicator")
+
+yr <- 2019
+
+scdb <- readRDS("./Markdown/Phase2/scdb.RData")
+
+## import component table data
+
+comp <- readRDS("./Markdown/Phase2/comp.RData")
+
+### Import woodland structure data
+
+#tabfinlst <- readRDS(paste0("./Results/Region_", a, "/tabfinlst.RData"))[[2]] %>% inner_join(dplyr::select(comp, c("OBJECTID", "areaa")), by = "OBJECTID")
+
+tabfinlst <- readRDS("./Markdown/Phase2/tabfinlst.RData")
+
+scotcomp <- readRDS("./Markdown/Phase2/scotcomp.RData")
+
+### subest of component database corresponding with felled woodland.
+
+compfell <- scotcomp %>% filter(luse %in% "PFE" & flyr >=(yr - 5)) %>% mutate(strt_cls = "temp_opn")
+
+### Subset of component database corresponding with permanently open habitats.
+
+#compperm <- scotcomp %>% filter(luse %in% c("AGR", "FMD", "FMW", "MAS", "MOW","OPN", "UNP")) %>% mutate(strt_cls = "Perm_opn")
+
+wdstr <- tabfinlst %>% dplyr::select(OBJECTID, areaa, strt_cls, SCOBJECTID) %>% group_by(OBJECTID) %>% summarise(areaa = max(areaa),
+                                                                                                                 strt_cls = first(strt_cls), 
+                                                                                                                 SCOBJECTID = first(SCOBJECTID))
+
+
+```
+
+## Stage 2.1 - spatial workflow for capturing open structure types
+
+## Stage 2.1.1 - Permanent open spatial workflow
+
+The first stage of the workflow involves constructing two separate subsets of the component table database to represent those components with i) no woodland-based components and ii) those with at least-one woodland component.
+
+The first table here is then used to construct a dataframe of unique sub-compartment ids for all stands with at least one non-woodland component.  The next step involved generating a subset of the sub-compartment database comprised of those stands that don't correspond with the component table data.  The above two subsets are then combined into a single layer to represent stands that either have at least one component of open habitat, or don't correspond with component table period.  This subset is then rasterised using a 50m resolution and then converted to point format.
+
+The workflow then iterates over each unique woodland block id and within each loop does the following tasks:
+
+i) construct a raster layer representing semi-natural open habitats that overlap with each woodland block.
+ii) Extract values from this raster using the points developed above.
+iii) Calculate the proportion of each sub-compartment that is comprised of semi-natural open habitats.
+iv) Filter the final results to keep only those sub-compartments with a dominance of open habitats.
+v) Assign the product of (iv) a structure class of "permanent open"
+
+For the semi-natural open habitat raster layer we combined a habitat survey dataset, the Land cover map 2019 dataset, and the NFI IFT dataset. The NFI data was used to identify areas of obviously non-semi-natural open habitat to then act as a mask to remove areas from the final open habitat raster. 
+
+
+```{r eval =F, echo=T, message=F,warning=F, results="hide"}
+
+### Function to carry out spatial analysis to identify sub-compartments classified as "permanent open" structure type ----
+
+## inputs - x = fls region id
+
+permfunc <- function(x, scotcomp,scdb, comp){
+
+  #setwd("C:/Users/44754/Documents/R/FR_work/FLS_bio_indicator/fls_wd_biodiversity_indicator/FLS_bioD_indicator")
+  
+  ### Need to select the inverse of woodland
+  
+  ## modifed component table function
+  
+  ## Select for components that don't have any woodland elements - i.e., open/unplantable ground
+  
+  compfuncx <- function(a, scotcomp){
+    
+    #### Constrain scotcomp df to FLS district region
+    
+    #### Create simple df of scdb objectid values and do appropriate join with scotcomp object to keep only those rows in 
+    #### scotcomp that correspond with the id vals in the former df.
+    
+    scdbid <-  data.frame(SCOBJECTID = unique(a$SCOBJECTID))
+    
+    comp <- scotcomp %>% 
+      
+      ## inner join here ensures that we keep only those component table rows which correspond with the sub-compartments in the current FLS region
+      
+      inner_join(scdbid, by = "SCOBJECTID") %>% 
+      mutate(blk = as.factor(paste0(cots_distr, "_", blk)))
+    
+    ##### Filter out all non-woodland rows according to the "luse" field
+    
+    ### List of acceptable luse codes
+    
+    lucod <- c("FMR", "FMS", "NAO", "PHF", "PIB", "PRP", "PSS", "PWC")
+    
+    comp<- comp %>% 
+      filter(!luse %in% lucod)
+    
+    return(comp)
+    
+    
+}
+  
+  ### Original component function - select for components with woodland elements - use this to arrive at final sub-compartments with no woodland components
+  
+  compfuncx2 <- function(a, scotcomp){
+    
+    #### Constrain scotcomp df to FLS district region
+    
+    #### Create simple df of scdb objectid values and do appropriate join with scotcomp object to keep only those rows in 
+    #### scotcomp that correspond with the id vals in the former df.
+    
+    scdbid <-  data.frame(SCOBJECTID = unique(a$SCOBJECTID))
+    
+    comp <- scotcomp %>% 
+      
+      ## inner join here ensures that we keep only those component table rows which correspond with the sub-compartments in the current FLS region
+      
+      inner_join(scdbid, by = "SCOBJECTID") %>% 
+      mutate(blk = as.factor(paste0(cots_distr, "_", blk)))
+    
+    ##### Filter out all non-woodland rows according to the "luse" field
+    
+    ### List of acceptable luse codes
+    
+    lucod <- c("FMR", "FMS", "NAO", "PHF", "PIB", "PRP", "PSS", "PWC")
+    
+    comp<- comp %>% 
+      filter(luse %in% lucod)
+    
+    return(comp)
+    
+    
+}
+  
+  ### Run custom component table function
+  
+  compx <- compfuncx(scdb, scotcomp)
+  
+  compx2 <- compfuncx2(scdb, scotcomp)
+  
+  ### Making tidy dataframe of sub-compartments with at least one woodland component row
+  
+  compx2df <- data.frame(SCOBJECTID = unique(compx2$SCOBJECTID)) %>% mutate(remove = 1)
+  
+  
+  ### Constructing dataframe of unique sub-compartment ids for all stands with at least one non-woodland component
+  
+  sclist <- data.frame(SCOBJECTID = unique(compx$SCOBJECTID))
+  
+  
+  
+  ### add subcs that don't correspond with component table
+  
+  comporig <- comp
+  comporig <- data.frame(SCOBJECTID = unique(comporig$SCOBJECTID)) %>% mutate(check = 1)
+  
+  ### Filter non woodland scdbs polygons that don't correspond with component table.
+  
+  scdbx2 <- scdb %>% 
+    left_join(comporig, by = "SCOBJECTID") %>% 
+    filter(is.na(check)) %>% 
+    as.data.frame() %>% dplyr::select(SCOBJECTID)
+  
+  ### update sclist dataframe - this represents subcompartments with at least one component of non-woodland and stands which don't correspond with any component entry.
+  
+  sclist <- rbind(sclist, scdbx2)
+  
+  
+  ## non-woodland scdb polygons - subcs with at least one component comprised of open habitat types.
+
+  ## These correspond with stands that either have at least one component of open habitat, or don't correspond with component table period.
+  
+  scdbnonwd <- scdb %>% inner_join(sclist, by = "SCOBJECTID") %>% left_join(dplyr::select(compx, c("SCOBJECTID", "spis", "areaa", "luse", "OBJECTID")), by = "SCOBJECTID") %>% 
+    group_by(SCOBJECTID) %>% summarise(blk = first(blk), areaa = sum(areaa))
+  
+  
+  
+  ### convert resultant dataset to point format
+  
+  at <- raster("C:/Users/44754/Documents/R/FR_work/FLS_bio_indicator/fls_wd_biodiversity_indicator/FLS_bioD_indicator/S_Bath_ESCdata/ESC_rasters/at.tif") %>% 
+    crop(scdb)
+  
+  atdis <- disaggregate(at, fact=5)
+  
+  scdbr <- fasterize(st_cast(scdbnonwd, "MULTIPOLYGON"), atdis, field = "SCOBJECTID")
+  
+  # ** convert rasterized version to point dataset ----
+  
+  rstpts <- rasterToPoints(scdbr, spatial = TRUE) %>% 
+    st_as_sf() %>% 
+    rename(SCOBJECTID = layer)
+  
+  saveRDS(rstpts, "C:/Users/44754/Documents/R/FR_work/FLS_bio_indicator/fls_wd_biodiversity_indicator/FLS_bioD_indicator/Markdown/Phase2/rstpts.RData")
+  
+  
+  
+  ### main scdb dataset dissolved to blk scale - used as raster in main analysis
+  
+  scdbx1 <- scdbnonwd %>% group_by(blk) %>% summarise(count = n()) %>% mutate(blkID = seq.int(nrow(.))) %>% dplyr::select(blk, blkID)
+  
+  scdbx1b <- as.data.frame(scdbnonwd) %>% left_join(as.data.frame(scdbx1), by = "blk") %>% dplyr::select(SCOBJECTID, blk, blkID)
+  
+  
+  ### updated rstpts with blkID values
+  
+  rstpts <- rstpts %>% left_join(scdbx1b, by = "SCOBJECTID") %>% dplyr::select(SCOBJECTID, blk, blkID) %>% mutate(ptid = seq.int(nrow(.)))
+  
+
+  
+  ### perform raster extract operation using these points and a raster version of FLS open habitat dataset cropped to the current scdb block boundary.
+  
+  ## Importing FLS open habitats polygon dataset
+  
+  opnhabs <- st_read("./Phase2/Open_habitats/FLS_habitasurvey_openhabitats_proper_V2.shp")
+  
+  # * Function to calculate open area proportion ----
+  
+  opnhabfunc2 <- function(scdbx1,d, scax, opnhabs, scdbptsx, lcmx2, nfiropn, nfirwd){
+    
+    print(paste0("Loop: ", d))
+    
+    scdbx <- scdbx1[scdbx1$blkID == d,]
+    
+    scdbptsx2 <- scdbptsx %>% filter(blkID == d) %>% 
+      as("Spatial") %>% as.data.frame() %>% rename(X = coords.x1, Y = coords.x2)
+    
+    # ** Rasterize open habitat polygons to 25m resolution raster ----
+    
+    opnr <- fasterize(opnhabs, disaggregate(crop(scax, scdbx), fact=10))
+    
+    # ** Crop 100m agg raster by current woodland block polygon ----
+    scagg100mc <- disaggregate(crop(scax, scdbx), fact=10)
+    
+    #### Need to fill in gaps using lcm2019 dataset
+    
+    ### reclassify lcmx raster
+    
+    lcmx2 <- crop(lcmx2, scdbx) %>% disaggregate(fact=4)
+    lcmx2[lcmx2 %in% c(1,2,3,4,12,20,21)] <- NA
+    lcmx2[lcmx2 > 0] <- 1
+    
+    #### update opnr raster with lcm semi-natural open habitat areas
+    
+    nfirx <- nfiropn %>% crop(scdbx) %>% disaggregate(fact=10)
+    nfirx[nfirx > 0] <- 9999
+    
+    ### Update opnr raster with NFI woodland data
+    
+    nfiry <- crop(nfirwd, scdbx) %>% disaggregate(fact=10)
+    nfiry[nfiry > 0] <- 9999
+    
+    
+    ### Convert all areas of overlap between NFI non semi-natural habitat and LCM to NA
+    
+    opnr <- raster::merge(nfiry, opnr, nfirx, lcmx2) %>% crop(scdbx)
+    opnr[opnr == 9999] <- NA
+    
+    opnr <- projectRaster(opnr, scagg100mc)
+    opnr[opnr>0] <- 1
+    
+    if(cellStats(opnr, 'sum') == 0){
+      
+      print("no open habitat data detected for current blkid")
+      
+      return()
+    }
+    
+    ### Raster extract operation
+    
+    opnext <- data.frame(ptid = scdbptsx2$ptid, openv = raster::extract(mask(opnr, scagg100mc), dplyr::select(scdbptsx2, c("X", "Y"))))
+    
+    #### aggregate across sub-compartments
+    
+    dfx <- scdbptsx2 %>% left_join(opnext, by = "ptid") %>% mutate(openv = ifelse(is.na(openv), 0, openv))
+
+    
+    dfx2 <- dfx %>% group_by(SCOBJECTID) %>% summarise(blkID = first(blkID), openvsum = sum(openv), count = n()) %>% 
+      mutate(comp_prop = openvsum/count)
+
+    
+    return(dfx2)
+  
+  }
+  
+  
+  ### need to construct rasterised version of all sub-compartments in current FLS region
+  
+  scdbr <- fasterize(st_cast(scdbx1, "MULTIPOLYGON"), atdis, field = "blkID")
+  
+  fls <- st_read("./FLS_districts2.shp") %>% 
+    group_by(Region_1) %>% summarise(count=n()) %>% 
+    mutate(area = st_area(.)/10000) %>% 
+    mutate(flsid = seq.int(nrow(.)))
+  
+  fls2 <- fls %>% 
+    filter(flsid == as.numeric(x))
+  
+  scax <- scdbr %>% 
+    crop(scdb)
+  
+  ### Import lcm scotland raster and crop to current region
+  
+  lcmx <- raster("./Markdown/Phase2/lcmx.tif") %>% crop(scdb)
+  
+  ### incorporate NFI data here - rasterize then burn into opnr raster dataset and replace all values with NA
+  ### Should remove any areas mistakenly classified as semi-natural in the opnr dataset
+  
+  ### first import the NFI dataset and filter to keep only the non semi-natural habitats/features.
+  
+  nfi <- st_read("./Markdown/Phase2/NFI_woodland_sample.shp")
+  
+  ### NFI open habitat types only - of these select for only non-semi-natural types.
+  
+  nfiopn <- nfi %>% 
+    filter(CATEGORY %in% "Non woodland") %>% 
+    filter(!IFT_IOA %in% c("Other vegetation", "Grassland", "River", "Open water", "Bare area")) %>% 
+    mutate(id = seq.int(nrow(.))) %>% mutate(rastval = 1)
+  
+  ### NFI woodland types only
+  
+  nfiwd <- nfi %>% filter(CATEGORY %in% "Woodland") %>% mutate(id = seq.int(nrow(.)), rastval = 1)
+  
+  ### rasterize
+  
+  nfiropn <- fasterize(nfiopn, atdis, field = "rastval") %>% crop(scdb)
+  
+  nfirwd <- fasterize(nfiwd, atdis, field = "rastval") %>% crop(scdb)
+  
+  
+  #### Open habitat function
+  
+  opnout <- mapply(opnhabfunc2, list(scdbx1), as.list(sort(unique(scdbx1$blkID))), list(scax), list(opnhabs), list(rstpts), list(lcmx), list(nfiropn), 
+                   list(nfirwd), SIMPLIFY = FALSE)
+  
+  
+  #### combine results
+  
+  dfinal <- plyr::compact(opnout)
+  
+  dfinal <- do.call(rbind, dfinal)
+  
+  ### Have to determine which sub-compartments have a dominance of open habitats - perhaps use a threshold value here of 0.6
+
+  dfinal2 <- dfinal %>% filter(comp_prop>0)
+  
+  dfopen3 <- dfinal2 %>% filter(comp_prop > 0.6)
+
+
+  return(dfopen3)
+  
+}
+
+permopn <- permfunc(a, scotcomp, scdb, comp)
+
+
+```
+
+```{r eval=T, echo = F, fig.cap = "A) Sample dataset sub-compartments, B) Point dataset", out.width="85%", fig.align = "center"}
+
+setwd("C:/Users/44754/Documents/R/FR_work/FLS_bio_indicator/fls_wd_biodiversity_indicator/FLS_bioD_indicator")
+
+rstptsx <- readRDS("./Markdown/Phase2/rstpts.RData")
+
+plot(st_geometry(scdb))
+plot(st_geometry(rstptsx), pch=3, col="red", add=TRUE)
+
+
+```
+
+```{r eval=T, message = F, warning = F, echo = F, fig.cap = "Areas of permanent open woodland structure type", out.width="75%"}
+
+permopn <- readRDS("./Markdown/Phase2/Permopnres.RData")
+
+scdbperm <- scdb %>% inner_join(permopn, by = "SCOBJECTID")
+
+plot(st_geometry(scdb))
+plot(st_geometry(scdbperm), col="red", add=TRUE)
+
+
+```
+
+
+## Stage 2.1.2 - Temporary open spatial workflow
+
+For this stage we calculated the proportion of overlap of each of a subset of sub-compartments that overlaps with areas of clear-fell as defined by the NFI IFT dataset.  To do this we first filtered the NFI IFT dataset to keep only polygons corresponding with the "Felled" IFT type, then coverted this to raster format (50m resolutiion).  This was followed by creating a sub-set of the sub-compartment database comprised of those stands that don't have a corresponding entry in the component table.  We then converted this subset to raster and then point format and use it to extract values from the NFI clear fell raster layer.  The results of this extraction exercise were then used to assign proportion values to each sub-compartment in the subset.
+
+```{r eval=F, echo=T, message=FALSE, warning=FALSE, results="hide"}
+
+tempfunc <- function(fls, atdis){
+
+  x <- unique(fls$Region_1)
+  
+  nfi <- st_read("./NFI_woodland_Scotland2018.shp") %>% 
+    filter(IFT_IOA %in% c("Felled")) %>% 
+    mutate(id = seq.int(nrow(.))) %>% mutate(rastval = 1)
+  
+  nfix <- fasterize(nfi, atdis, field = "rastval") %>% crop(fls)
+  
+  ### Import the very first version of the scdb polygon dataset - not filtered for only woodland
+  
+  scdb <- readRDS(paste0("./masterpoints/Region_",x,"/scdb_Region_", x,".RData")) %>% 
+    mutate(blk = as.factor(paste0(cots_distr, "_", blk))) %>% 
+    group_by(SCOBJECTID) %>% summarise(blk = first(blk), template_n = first(template_n))
+  
+  ### add subcs that don't correspond with component table
+
+comporig <- readRDS(paste0("./Results/Region_", x, "/comp.RData"))
+comporig <- data.frame(SCOBJECTID = unique(comporig$SCOBJECTID)) %>% mutate(check = 1)
+
+### Filter scdbs polygons that don't correspond with component table.
+
+scdbx2 <- scdb %>% 
+  left_join(comporig, by = "SCOBJECTID") %>% 
+  filter(is.na(check)) %>% 
+  st_cast("MULTIPOLYGON")#%>% 
+#as.data.frame() %>% dplyr::select(SCOBJECTID)
+
+scdbr <- fasterize(scdbx2, nfix, field = "SCOBJECTID")
+
+# ** convert rasterized version to point dataset ----
+
+rstpts <- rasterToPoints(scdbr, spatial = TRUE) %>% 
+  as.data.frame()
+
+opnext <- data.frame(SCOBJECTID = rstpts$layer, rastval = raster::extract(nfix, dplyr::select(rstpts, c("x", "y"))))
+
+dfinal <- opnext %>% mutate(rastval = ifelse(is.na(rastval), 0, rastval)) %>% group_by(SCOBJECTID) %>% summarise(count = n(), freq = sum(rastval)) %>% 
+  mutate(prop = freq/count) %>% filter(prop > 0.5)
+
+return(dfinal)
+
+
+}
+
+## a = fls region
+
+fls <- st_read("./FLS_districts2.shp") %>% 
+  group_by(Region_1) %>% summarise(count=n()) %>% 
+  mutate(area = st_area(.)/10000) %>% 
+  mutate(flsid = seq.int(nrow(.)))
+
+fls2 <- fls %>% 
+  filter(flsid == as.numeric(a))
+
+at <- raster("C:/Users/44754/Documents/R/FR_work/FLS_bio_indicator/fls_wd_biodiversity_indicator/FLS_bioD_indicator/S_Bath_ESCdata/ESC_rasters/at.tif") %>% 
+  crop(fls2)
+
+atdis <- disaggregate(at, fact=5)
+
+## Run custom temporary open function ----
+
+tempopn2 <- tempfunc(fls2, atdis)
+
+
+```
+
+```{r eval=T, message = F, warning = F, echo = F, fig.cap = "Areas of temporary open woodland structure type", out.width="75%"}
+
+tempopn <- readRDS("./Markdown/Phase2/tempopndf.RData")
+
+scdbtemp <- scdb %>% inner_join(tempopn, by = "SCOBJECTID")
+
+plot(st_geometry(scdb))
+plot(st_geometry(scdbtemp), col="red", add=TRUE)
+
+
+```
+
+## Stage 3 - Microhabitats
+
+## Stage 3.1 - Bareground
+
+To define areas of bareground we used a dataset of all public paths in Scotland (SNH).  The path dataset is first converted to 10m raster format, then the sub-compartment point dataset is used to extract values from the path raster.  Those sub-compartments with a sufficient overlap with areas of bareground are assigned the bareground microhabitat.
+
+```{r echo = T, eval = F}
+
+### bareground ----
+
+### a = region id (1-5), b = scdb, fls = fls boundary dataset
+
+baref <- function(a,b, fls){
+  
+  ##### bare ground module ###
+  
+  #### Import paths 10m raster dataset
+  
+  pathsr <- raster("./Phase2/Allpaths_10mrast.tif")
+  
+  fls2 <- fls
+  
+  pathsr2 <- crop(pathsr,fls2)
+  
+  scdb <- b
+  
+  #### iterate over each woodland block and for each iteration:
+  ### i) crop and mask path raster to current woodland block
+  ### ii) convert (i) to points and extract values from scdbr to each point
+  
+  pathfunc <- function(a,b,c){
+    
+    #### a = scdb, b = unique blk id (blkid3), c = paths raster
+    
+    #### function to generate points
+    
+    print(paste0("blk id = ", b))
+    
+    scdbx <- a[a$blk %in% b,] %>% st_cast("MULTIPOLYGON")
+    
+    pathrast <- crop(c,scdbx)
+    
+    scdbrx <- fasterize(scdbx,pathrast, field="SCOBJECTID")
+    
+    pathpts <- rasterToPoints(pathrast, Spatial=TRUE) %>% as.data.frame() %>% dplyr::select(x,y)
+    
+    if(nrow(pathpts)==0){
+      
+      print("no paths within current woodland block")
+      
+      return()
+      
+    }
+    
+    dfin <- data.frame(SCOBJECTID = raster::extract(scdbrx,pathpts)) %>% 
+      filter(!is.na(SCOBJECTID))
+    
+    if (nrow(dfin)==0){
+      
+      print("no paths intercept woodland stands")
+      
+      return()
+      
+    }
+    
+    dfin <- data.frame(SCOBJECTID = unique(dfin$SCOBJECTID), path = 1)
+    
+    return(dfin)
+    
+  }
+  
+  rptsx <- mapply(pathfunc, list(scdb), as.list(unique(as.character(scdb$blk))), list(pathsr2), SIMPLIFY = FALSE)
+  
+  rptsx2 <- plyr::compact(rptsx)
+  
+  rptsx2 <- do.call(rbind, rptsx2)
+  
+  ### join back to latest scdb object
+  
+  scdb2 <- scdb %>% left_join(rptsx2, by = "SCOBJECTID") %>% 
+    mutate(path = ifelse(is.na(path), 0, path)) %>% 
+    as.data.frame() %>% 
+    group_by(SCOBJECTID) %>% summarise(blk = first(blk), path = max(path), count = n(), sumpath = sum(path)) %>% 
+    dplyr::select(SCOBJECTID, blk, path, count, sumpath)
+  
+  saveRDS(scdb2, paste0("./Phase2/Results/Region_", a, "/scdbbareground_pt1_Region_", a, ".RData"))
+  
+  #### Combine with separate dataset of "luse" class UNP
+  
+  bareg <- readRDS(paste0("./Phase2/SCDB_UNP_felled_data_R", a, ".RData"))
+  
+  scdb3 <- scdb2 %>% left_join(dplyr::select(bareg,c("SCOBJECTID", "UNP")), by = "SCOBJECTID") %>% 
+    mutate(bareground = ifelse(sumpath == 1 | UNP == 1, 1, 0)) %>% dplyr::select(SCOBJECTID, bareground)
+  
+  scdbout <- scdb %>% left_join(scdb3,by="SCOBJECTID")
+  
+  return(scdbout)
+  
+}
+
+
+```
+
+```{r eval=T, message = F, warning = F, echo = F, fig.cap = "Areas of bareground microhabitat", out.width="75%"}
+
+bareg <- readRDS("./Markdown/Phase2/bareground.RData") %>% filter(!is.na(bareground))
+
+scdbbare <- scdb %>% inner_join(bareg, by = "SCOBJECTID")
+
+plot(st_geometry(scdb))
+plot(st_geometry(scdbbare), col="red", add=TRUE)
+
+
+```
+
+## Stage 3.2 - Glades
+
+For the glade microhabitat we used a method which compared calculated basal areas for individual sub-compartments against a list of predefined, species-specific basal area thresholds that are deemed to represent glade-like canopy conditions.  Basal areas were calculated using existing forest growth model algorithms and data from the component table.  Specific workflows were used for thinned, unthinned, and understocked broadleaf stands separately.  Understocked broadleaf stands were identifed using the latest Land Management Area point dataset (filtered to keep only lma classes 1 and 2).  We then selected for those sub-compartments which intercepted these LMA areas.  Glade basal area thresholds were derived for a range of generic broadleaf species following extensive research into tree canopy/basal area associations.
+
+```{r echo = T, eval = F}
+
+### Glades ----
+
+basalfunc <- function(a){
+  
+  ### sprank1
+  
+  sprank1 <- readRDS("./Markdown/Phase2/sprank1.RData")
+  
+  calcpm <- read.csv("C:/Users/44754/Documents/R/FR_work/FLS_bio_indicator/fls_wd_biodiversity_indicator/FLS_bioD_indicator/Species_dbhcalc_parameters.csv") %>% 
+    rename(spis = Species) %>% 
+    mutate(suid = paste0(spis, "_", as.character(Thin)))
+  
+  splst <- read.csv("./spislist_v2.csv")
+  
+  brdlst <- as.vector(splst[(splst$Type %in% c("brd")),1])
+  
+  #### Thinned conifer and broadleaved stands ########
+  
+  
+  #### Only operate on rows with an actual point id at current (ideally all rows should have a point id)
+  
+  sctcmp3 <- sprank1 %>% 
+    dplyr::select(c("uid", "ptid","OBJECTID", "SCOBJECTID", "thinfin", "yldfin", "spacing", "age", "species", "dbhsp"))
+  
+  sctcmp3 <- sctcmp3 %>% 
+    mutate(suid = paste0(dbhsp, "_", as.character(thinfin))) %>% 
+    left_join(dplyr::select(calcpm, c(-spis)), by = "suid")
+  
+  sctcmp3[,12:20][is.na(sctcmp3[,12:20])] <- 0
+  
+  #saveRDS(sctcmp3, paste0("./Phase2/Results/Region_", a, "/sctcmp3_R", a, ".RData"))
+  
+  
+  
+  # ** Part 1 - Most conifers (thinned/unthinned) and all thinned broadleaves ----
+  
+  ## Vector holding conifer species to be treated as unthinned broadleaves
+  
+  conunthin <- c("RC", "WH", "GF", "NF")
+  
+  sctcmp3a <- sctcmp3 %>% 
+    
+    ### Filter for species NOT in the broadleaf spp. list AND thinned
+    ### Filter out above subset
+    
+    filter(!((species %in% brdlst | dbhsp %in% brdlst) & thinfin == 0)) %>% 
+    
+    ### additional filter to remove instances of non-standard conifers
+    
+    filter(!(species %in% conunthin | dbhsp %in% conunthin)) %>% 
+    
+    mutate(calcht = ((a1+a2*yldfin+a3*spacing)* `^`(1-exp(a4*-1*age), a5))) %>% 
+    mutate(calcdbh = (b1 + b2*spacing)*`^`(calcht, b4)) %>% 
+    mutate(calcdbh = as.numeric(calcdbh))
+  
+  
+  sctcmp3a <- sctcmp3a %>% rowwise() %>% mutate(TopHeight =((14.13 + 1.144*yldfin)*(1-exp(-1*0.040761*age))^1.0617135)) %>% 
+    mutate(MeanDbh = (0.037799*TopHeight^2.27217)) %>% 
+    
+    mutate(mindbh = ifelse(age <15, max(0,-1.913+0.55654*MeanDbh), max(0,-1.815+0.65401*MeanDbh))) %>% 
+    as.data.frame() %>% rowwise() %>% mutate(Maxdbh = ifelse(age < 15, (max(0, -1.815 + 0.65401*MeanDbh)), 1 + (1.577 + 1.73206*MeanDbh))) %>% as.data.frame() %>% 
+    mutate(stemD = ifelse(exp(10.74 - 1.501606*log(MeanDbh))>4450, 4450, exp(10.74 - 1.501606*log(MeanDbh))))
+  
+  ### Calculating dbh range at sub-compartment level (using lowest mindbh value and highest maxdbh value across all components in each sub-compartment)
+  
+  sctcmp3b <- sctcmp3a %>% filter(!is.na(calcdbh)) %>%  
+    group_by(uid) %>% mutate(Maxdbhsc = max(Maxdbh), Mindbhsc = min(mindbh), Meandbhsc = max(MeanDbh), SCOBJECTID = first(SCOBJECTID)) %>% 
+    ungroup() %>% as.data.frame() %>% mutate(dbhrangesc = Maxdbhsc - Mindbhsc)
+  
+  #### basal area calculation for thinned stands
+  
+  sctcmpthin <- sctcmp3b %>% mutate(barea1 = (3.14 * (Meandbhsc/200)^2)*stemD)
+  
+  
+  
+  #### unthinned broadleaf stands ######
+  
+  stempars <- read.csv("./Stem_density_parameters_August2020.csv")
+  
+  sctcmp3 <- sctcmp3 %>%  mutate(K = 0, P = 0) 
+  
+  for (k in 1:nrow(stempars)){
+    
+    stemparsx <- stempars[k,]
+    
+    r2 <- as.list(scan(text = as.character(stemparsx$Species), what = ","))
+    
+    r2 <- trimws(r2, whitespace = ",")
+    
+    ### Need to account for MB classes
+    
+    sctcmp3<- sctcmp3 %>%
+      mutate(K = ifelse(species %in% r2, stemparsx$K, K),
+             P = ifelse(species %in% r2, stemparsx$P, P)) %>% 
+      
+      ### second round of metric calculations to account for MB/MC classes
+      
+      mutate(K = ifelse((species %in% c("MB", "MC")) & (dbhsp %in% r2), stemparsx$K, K)) %>% 
+      mutate(P = ifelse((species %in% c("MB", "MC")) & (dbhsp %in% r2), stemparsx$P, P)) %>% 
+      
+      mutate(K = ifelse(K == 0 & dbhsp %in% r2, stemparsx$K, K),
+             P = ifelse(P == 0 & dbhsp %in% r2, stemparsx$P, P))
+    
+    
+  }
+  
+  
+  ### understocked MB stands #######
+  
+  #### First need to separate out truly "understocked" MB stands and assign these a separate distinct stocking density
+  
+  ### Import scdb polygons that intercept lma1/2 points
+  
+  ### Lower stocking density than default 4500
+  
+  initstockingd1 <- 2500
+  
+  #### Need to make this Region specific
+  
+  lmainter <- st_read(paste0("./Phase2/Results/Region_", a, "/Lma1_2_intercept.shp")) %>% mutate(understock = ifelse(spis %in% c("MB"), 1, 0)) %>% 
+    filter(understock == 1)
+  
+  ### Create subset of scdb keeping only stands that intercept lma1/2 point data
+  
+  sctcmpunder <- sctcmp3 %>% inner_join(dplyr::select(as.data.frame(lmainter), c("OBJECTID")), by = "OBJECTID")
+  
+  sctcmpu1 <- sctcmpunder %>% filter(K >0) %>% 
+    rowwise() %>% mutate(TopHeight =((14.13 + 1.144*yldfin)*(1-exp(-1*0.040761*age))^1.0617135)) %>% 
+    mutate(MeanDbh = (0.037799*TopHeight^2.27217)) %>% 
+    
+    mutate(mindbh = ifelse(age <15, max(0,-1.913+0.55654*MeanDbh), max(0,-1.815+0.65401*MeanDbh))) %>% 
+    as.data.frame() %>% rowwise() %>% mutate(Maxdbh = ifelse(age < 15, (max(0, -1.815 + 0.65401*MeanDbh)), 1 + (1.577 + 1.73206*MeanDbh))) %>% as.data.frame() %>%  
+    
+    mutate(stemden2 = K/MeanDbh^P) %>% mutate(stemden2 = ifelse(stemden2 > initstockingd1, initstockingd1, stemden2))
+  
+  sctcmpu2 <- sctcmpu1 %>%  
+    group_by(uid) %>% mutate(Maxdbhsc = max(Maxdbh), Mindbhsc = min(mindbh), Meandbhsc = max(MeanDbh), SCOBJECTID = first(SCOBJECTID)) %>% 
+    ungroup() %>% as.data.frame() %>% mutate(dbhrangesc = Maxdbhsc - Mindbhsc) %>% 
+    rename(stemD = stemden2)
+  
+  #### Calculate basal area for understocked unthinned MB stands
+  
+  sctcmpunder2 <- sctcmpu2 %>% mutate(barea1 = (3.14 * (Meandbhsc/200)^2)*stemD) %>% mutate(check = 1)
+  
+  
+  
+  #### All other unthinned stands #####
+  
+  initstockingd <- 4500
+  
+  sctcmp4 <- sctcmp3 %>% 
+    ### Filter for species IN the broadleaf spp. list AND unthinned
+    #filter((species %in% brdlst |dbhsp %in% brdlst) & thinfin == 0) %>% 
+    
+    filter((species %in% brdlst |dbhsp %in% brdlst | species %in% conunthin | dbhsp %in% conunthin) & thinfin == 0) %>%
+    
+    ### Remove all instances of MB
+    left_join(dplyr::select(as.data.frame(sctcmpunder2), c("uid", "check")), by = "uid") %>% 
+    filter(is.na(check)) %>% 
+    
+    ### calculate initial dbh 
+    mutate(calcht = ((a1+a2*yldfin+a3*spacing)* `^`(1-exp(a4*-1*age), a5))) %>% 
+    mutate(calcdbh = (b1 + b2*spacing)*`^`(calcht, b4)) %>% 
+    mutate(calcdbh = as.numeric(calcdbh))
+  
+  
+  sctcmp4 <- sctcmp4 %>% filter(K >0) %>% 
+    rowwise() %>% mutate(TopHeight =((14.13 + 1.144*yldfin)*(1-exp(-1*0.040761*age))^1.0617135)) %>% 
+    mutate(MeanDbh = (0.037799*TopHeight^2.27217)) %>% 
+    
+    mutate(mindbh = ifelse(age <15, max(0,-1.913+0.55654*MeanDbh), max(0,-1.815+0.65401*MeanDbh))) %>% 
+    as.data.frame() %>% rowwise() %>% mutate(Maxdbh = ifelse(age < 15, (max(0, -1.815 + 0.65401*MeanDbh)), 1 + (1.577 + 1.73206*MeanDbh))) %>% as.data.frame() %>%  
+    
+    mutate(stemden2 = K/MeanDbh^P) %>% mutate(stemden2 = ifelse(stemden2 > initstockingd, initstockingd, stemden2))
+  
+  sctcmp4b <- sctcmp4 %>% filter(!is.na(calcdbh)) %>%  
+    group_by(uid) %>% mutate(Maxdbhsc = max(Maxdbh), Mindbhsc = min(mindbh), Meandbhsc = max(MeanDbh), SCOBJECTID = first(SCOBJECTID)) %>% 
+    ungroup() %>% as.data.frame() %>% mutate(dbhrangesc = Maxdbhsc - Mindbhsc) %>% 
+    rename(stemD = stemden2)
+  
+  #### calculate basal area
+  
+  sctcmpunthin <- sctcmp4b %>% mutate(barea1 = (3.14 * (Meandbhsc/200)^2)*stemD)
+  
+  
+  
+  ### combining all thinned and unthinned stands results
+  
+  sctcmpbasal <- rbind(dplyr::select(sctcmpthin, -c("calcdbh", "calcht")), dplyr::select(sctcmpunthin, -c("calcdbh","calcht", "K", "P", "check")), 
+                       dplyr::select(sctcmpunder2, -c("K", "P", "check")))
+  
+  
+  ### join back to main results dataframe
+  
+  ### use wdtypes results here
+  
+  wdtypesx <- readRDS(paste0("./Results/Region_", a, "/wdtypes.RData"))[[1]] %>% dplyr::select(uid, prim_code)
+  
+  ### join wdtypesx to basal area results
+  
+  scdbres2 <- sctcmpbasal %>% left_join(wdtypesx, by = "uid") %>% 
+    mutate(hab = as.character(prim_code))
+  
+  
+  #### Identify and label stands within each FDT which have conditions related to glade microhabitat
+  
+  ### Import glade threshold reference table
+  
+  glade <- read.csv("./Glade_thresholds.csv")
+  
+  hablst <- as.vector(unique(glade$FDT))
+  
+  finlst <- list()
+  
+  for (b in 1:length(hablst)){
+    
+    scdbx <- scdbres2 %>% filter(substr(hab,1,1) %in% c(hablst[b])) %>% 
+      filter(barea1 < as.numeric(glade[b,]$Glade_thresh)) %>% as.data.frame() %>% mutate(glade = 1) %>% dplyr::select(uid, glade)
+    
+    finlst[[b]] <- scdbx
+    
+  }
+  
+  finlst2 <- plyr::compact(finlst)
+  
+  finlst2 <- do.call(rbind, finlst2)
+  
+  ### join back to main result dataset and dissolve by SCOBJECTID
+  
+  ### Note:  This captures any instances of glades within a sub-compartment.
+  
+  scdbres3 <- scdbres2 %>% left_join(finlst2, by = "uid") %>% mutate(glade = ifelse(is.na(glade), 0, glade))
+  
+  saveRDS(scdbres3, "./Markdown/Phase2/glade_results.RData")
+  
+  
+  ### export for exploration in QGIS ####
+  
+  ### glade microhabitat results
+  
+  scdbres3 <- scdbres2 %>% left_join(finlst2, by = "uid") %>% mutate(glade = ifelse(is.na(glade), 0, glade)) %>% 
+    group_by(SCOBJECTID) %>% summarise(prim_code = first(prim_code), glade = max(glade)) %>% filter(glade>0)
+  
+  ### join this to latest results dataset
+  
+  scdbresout <- readRDS("./Markdown/Phase2/scdb.RData") %>% inner_join(scdbres3,by="SCOBJECTID") %>% 
+    group_by(SCOBJECTID) %>% summarise(glade = max(glade))
+  
+  return(scdbresout)
+  
+}
+
+```
+
+
+```{r echo = F, eval = T, warning = F, fig.cap = "Areas of glade microhabitat", out.width="75%"}
+
+
+gladev <- readRDS("./Markdown/Phase2/glade_results.RData") %>% dplyr::select(SCOBJECTID, glade) %>% filter(glade ==1) %>% 
+  group_by(SCOBJECTID) %>% summarise(count=n())
+
+scdbglade <- scdb %>% inner_join(gladev, by = "SCOBJECTID")
+
+plot(st_geometry(scdb))
+plot(st_geometry(scdbglade), col="red", add=TRUE)
+
+```
+
+## Stage 3.3 - Deadwood
+
+Deadwood volume for individual stands was acquired via simulating deadwood accumulation using established forest growth model algorithms.  In this manner we modelled the accumulation of deadwood in individual stands starting from the earliest stand age that can generate deadwood.  The final deadwood volume was modified by subtracting the volume of deadwood deemed to have fully decomposed.
+
+```{r echo = T, eval = F}
+
+# Deadwood workflow ----
+
+#### Dead wood automated method #########
+
+### a = region id
+
+deadfunc <- function(a){
+  
+  # * Import previously constructed dataframe holding data on yield class - created during early stages of dbh calculations ----
+  
+  sctcmp3 <- readRDS(paste0("./Results/Region_", a, "/sctcmp3_R", a, ".RData"))
+  
+  # * Construct vector of all unique yield class values stored in 'sctcmp3' vector ----
+  
+  yldlist <- as.vector(unique(sctcmp3$yldfin))
+  
+  # * Setup up dataframe to store yieldclass-specific stem density values ----
+  
+  dfin <- data.frame(yldclass = integer(), Standage = integer(), TopHeight = double(), MeanDbh = double(), minDbh = double(), Maxdbh = double(), stemD = double(), Ndead = double(), deadvol = double())
+  
+  ## * Iterate over each unique yield class in current FLS region data subset ----
+  
+  for (b in 1:length(yldlist)){
+    
+    ## Setup up initial dataframe comprised of yieldclass and stand age (in sequences of 5)
+    
+    df1 <- data.frame(yldclass = yldlist[b], Standage = seq.int(0,120,5)) %>% mutate(Standage = ifelse(Standage == 0, 1, Standage))
+    
+    ## ** Calcualte top height using yield class and age values ----
+    
+    df1$TopHeight <- ((14.13 + 1.144*df1$yldclass)*(1-exp(-1*0.040761*df1$Standage))^1.0617135)
+    
+    ## ** Use new topheight value to arrive at mean dbh metric ----
+    
+    df1$MeanDbh <- (0.037799*df1$TopHeight^2.27217)
+    
+    ## ** Calcualte min, max and mean dbh values and from this stem density ----
+    
+    df2 <- df1 %>% rowwise() %>% mutate(mindbh = ifelse(Standage <15, max(0,-1.913+0.55654*MeanDbh), max(0,-1.815+0.65401*MeanDbh))) %>% 
+      as.data.frame() %>% rowwise() %>% mutate(Maxdbh = ifelse(Standage < 15, (max(0, -1.815 + 0.65401*MeanDbh)), 1 + (1.577 + 1.73206*MeanDbh))) %>% as.data.frame() %>% 
+      mutate(stemD = ifelse(exp(10.74 - 1.501606*log(MeanDbh))>4450, 4450, exp(10.74 - 1.501606*log(MeanDbh))))
+    
+    # ** iterate over each age class - to calculate number of dead trees and dead tree volume for each stand age class ----
+    
+    dflst <- list()
+    
+    agecls <- as.vector(unique(df2$Standage))
+    
+    for (x in 1:length(unique(df2$Standage))){
+      
+      if (x ==1){
+        
+        dfx <- df2[df2$Standage==agecls[x],]
+        
+        ## Set state of number of dead trees ('Ndead') and deadwood volume ('deadvol') to 0 to simulate the first year of woodland (planting year)
+        
+        dfx$Ndead[x] <- 0
+        dfx$deadvol[x] <- 0
+        
+        dfx <- dfx %>%  dplyr::select(Standage, Ndead, deadvol)
+        
+        dflst[[x]] <- dfx
+        
+      } else {
+        
+        #### Extract current stand age row and one row up from it (representing 5 years earlier)
+        
+        dfx <- df2[(x-1):x,]
+        
+        ### Estimate number of dead stems by subtracting the latest stem density from the value generated 1 loop earlier (5 years earlier)
+        
+        dfx$Ndead[2] <- dfx$stemD[1] - dfx$stemD[2]
+        
+        ### for dead wood volume need to draw upon the deadvol calculated for the last loop
+        
+        dfx$deadvol[2] <- ((dfx$MeanDbh[2]/200)^2 * 3.14 * dfx$Ndead[2] * dfx$TopHeight[2] * 0.42) + dflst[[x-1]]$deadvol[1]
+        
+        ###select to keep only row 2
+        
+        dfx <- dfx[2,]
+        
+        dflst[[x]] <- dfx %>% dplyr::select(Standage, Ndead, deadvol)
+        
+      }
+      
+      
+    }
+    
+    dedf <- do.call(rbind, dflst)
+    
+    df3 <- df2 %>% left_join(dedf, by = "Standage")
+    
+    dfin <- rbind(dfin, df3)
+    
+  }
+  
+  # * Preparing final results dataframe ----
+  
+  ### assigning values to original dataset
+  
+  mround <- function(x,base){
+    base*round(x/base)
+  }
+  
+  dfin2 <- dfin %>% mutate(deid = paste0(yldclass, "_", Standage)) %>% dplyr::select(Ndead, deadvol, deid) %>% 
+    mutate(Ndead = ifelse(is.na(Ndead), 0, Ndead), deadvol = ifelse(is.na(deadvol), 0, deadvol))
+  
+  
+  
+  sctcmp4 <- sctcmp3 %>% 
+    ### Filter for species IN the broadleaf spp. list AND unthinned
+    
+    ## Currently assumes that conifers don't contribute ecologically viable deadwood
+    
+    filter(thinfin == 0) %>% 
+    
+    ### create dedid value comprising the YC and 
+    
+    mutate(age2 = mround(age, 5)) %>% 
+    mutate(age2 = ifelse(age2 == 0, 5, age2)) %>% 
+    mutate(deid = paste0(yldfin, "_", age2)) %>% 
+    left_join(dfin2, by = "deid")
+  
+  
+  
+  
+  #### Accounting for decay rate in deadwood ----
+  
+  dfinx <- dfin %>% filter(deadvol > 0) %>% group_by(yldclass) %>% slice(which.min(deadvol)) %>% dplyr::select(yldclass,Standage) %>% 
+    rename(yldfin = yldclass)
+  
+  sctcmpx <- sctcmp4 %>% left_join(dfinx, by = "yldfin") %>% rename(Earliest_decay = Standage) %>% 
+    mutate(decay_yrs = age2 - Earliest_decay)
+  
+  ### Import deadwood decay rate dataframe
+  
+  decay <- read.csv("./Phase2/Deadwood_decay/Deadwood_decay.csv")
+  
+  ### Join this to sctcmpx
+  
+  sctcmpx2 <- sctcmpx %>% left_join(decay, by = "species") %>% mutate(decayint = decay_yrs - Decay) %>% filter(decayint>0) %>% 
+    mutate(yearlost = Earliest_decay + decayint)
+  
+  
+  sctx <- sctcmpx2 %>% dplyr::select(uid, yearlost, yldfin, deadvol) %>% rename(deadvol_init = deadvol) %>% mutate(deid = paste0(yldfin, "_", yearlost)) %>% 
+    left_join(dfin2, by = "deid") %>% mutate(deadvolfin = deadvol_init - deadvol)
+  
+  #### Join back to sctcmp4 and update deadwood volume where appropriate
+  
+  sctcmp5 <- sctcmp4 %>% left_join(dplyr::select(sctx, c("uid", "deadvolfin")), by = "uid") %>% mutate(deadvol = ifelse(!is.na(deadvolfin), deadvolfin, deadvol)) %>% 
+    dplyr::select(-c(deadvolfin))
+  
+  
+  
+  # ** export results ----
+  
+  saveRDS(sctcmp5, paste0("./Phase2/Results/Region_", a, "/Deadwood_R", a, ".RData"))
+  
+  return(sctcmp5)
+
+}
+
+
+
+```
+
+```{r echo = F, eval = T, warning = F, fig.cap = "Areas of deadwood microhabitat", out.width="75%"}
+
+
+deadv <- readRDS("./Markdown/Phase2/Deadwood_R.RData")
+
+scdbdead <- scdb %>% inner_join(deadv, by = "SCOBJECTID")
+
+plot(st_geometry(scdb))
+plot(st_geometry(scdbdead), col="red", add=TRUE)
+
+```
+
+## Stage 3.4 - Complex understorey with glades
+
+For areas of complex understorey and glade we first extracted those sub-compartments that were assessed to have glade conditions from the earlier analysis.  We combined this with stands which had either a structure class of "regen and scrub" or had more than 5 unique tree structure types amongst it's components.
+
+
+```{r echo = T, eval = F}
+
+complexfunc <- function(a){
+  
+  glades <- readRDS("./Markdown/Phase2/glade_results.RData") %>% filter(glade ==1)
+  
+  ### Import main result dataset
+  
+  scdbres2 <- readRDS("./Markdown/Phase2/tabfinlst.RData") %>%
+    
+    ### calculate number of unique structure class types
+    
+    group_by(SCOBJECTID) %>% mutate(Nstrc = length(unique(strt_cls))) %>% ungroup() %>% 
+    
+    ### create new field to store scrub/regen presence - base value assignment on criteria:  structure class type "regen and scrub" OR Nstrc value >=6
+    
+    mutate(scr_reg = ifelse((strt_cls %in% c("Regen and scrub") | Nstrc >=6), 1, 0)) %>% 
+    
+    #### join with glades dataset
+    
+    inner_join(dplyr::select(as.data.frame(glades),c("uid")),  by = "uid") %>% 
+    dplyr::select(uid, ptid, SCOBJECTID, OBJECTID, scr_reg, strt_cls) %>% 
+    
+    #### dissolve by SCOBJECTID to export to QGIS
+    
+    group_by(SCOBJECTID) %>% summarise(scr_reg = max(scr_reg))
+  
+  scdbres2b <- scdbres2 %>% filter(scr_reg > 0)
+  
+  ### join back with latest results polygon dataset
+  
+  scdbresfin <- readRDS("./Markdown/Phase2/scdb.RData") %>% inner_join(scdbres2b,by="SCOBJECTID") %>% 
+    group_by(SCOBJECTID) %>% summarise(count= n())
+
+  return(scdbresfin)
+  
+}
+
+
+
+
+```
+
+
+```{r echo = F, eval = T, warning = F, fig.cap = "Areas of complex understorey with glades microhabitat", out.width="75%"}
+
+
+compunder <- as.data.frame(readRDS("./Markdown/Phase2/scdbresfin.RData")) %>% dplyr::select(-c(geometry))
+
+scdbcompx <- scdb %>% inner_join(compunder, by = "SCOBJECTID")
+
+plot(st_geometry(scdb))
+plot(st_geometry(scdbcompx), col="red", add=TRUE)
+
+```
+
+
+## Stage 3.5 - Water and wet ground
+
+For defining areas of water and wet ground we drew upon a wide range of spatial datasets including the land cover map 2019 (CEH), OS water courses (OS), Soil Moisture regime and topographic wetness index (TWI) (FR-derived datasets), and the results of a separate woodland type classification exercise.  Each one of these unique layers was used to construct a final raster dataset capturing all water and wetground within the study landscape.  The rules used to define such ground for each dataset are described below:
+
+i) Land cover map (CEH) - all landcover classes corresponding with either standing or running water
+ii) Soil Moisture regime - all areas classified as either "wet" or "very wet" according to the ESC classification system
+iii) TWI - All areas that lie within the top 70% decile of the original dataset
+iv) Woodland type - all stands classified as Forest Development types "I2" or "G1"
+
+
+```{r echo = T, eval = F}
+
+### a = FLS region id, c = scdball
+
+waterfunc <- function(a, scdb, scdballpts){
+  
+  
+  scdbb <- st_buffer(scdb, 2000) %>% st_union() %>% st_as_sf()
+  
+  ## Stage 1 - LCM water habitats ----
+    
+    print ("LCM water dataset not present - proceeding to construct")
+    
+    #### extracting water-based habitats from lcm 2019
+    
+    lcm <- raster("./LCM2019/LCM2019_Scotland.tif")
+    
+    lcmcrp <- crop(lcm,scdbb)
+    
+    ###currently selecting for inland water features - and "wetland" habitats
+    
+    ### 2 column matrix ###
+    
+    m <- c(1, NA, 2, NA, 3,  NA, 4, NA, 5, NA, 6, NA,7,NA, 8,1,9, NA,10, NA, 11, 1, 12, NA, 13, NA, 14, 1, 15,NA,16,NA, 17,NA, 18,NA, 19, 1, 20, NA, 21, NA)
+    
+    rclmat <- matrix(m, ncol=2, byrow=TRUE)
+    
+    lcmrc <- reclassify(lcmcrp, rclmat)
+    
+    writeRaster(lcmrc, "./Markdown/Phase2/lcmrc.tif", overwrite=TRUE)
+
+  
+  #### mosaic with OS river raster dataset (2 of these - 1 a previous dataset developed for N4S and the other the latest OS open river dataset)
+  
+  oswat <- raster("./Phase2/OSSEPA_loch_merge25m.tif") %>% 
+    crop(scdbb)
+  
+  OSr <- raster("./Phase2/OS_openrivers_Scotland.tif") %>% crop(scdbb)
+  origin(OSr) <- origin(oswat)
+  
+  oswat <- merge(oswat,OSr)
+  
+  writeRaster(oswat, "./Markdown/Phase2/oswat.tif", overwrite=TRUE)
+  
+  ### Stage 2 - twi percentile raster ----
+    
+    print ("Twi raster not present - proceeding to construct")
+    
+    ### constructing twi percentile raster
+    
+    twi <- raster("./Phase2/TWI_UK.tif") %>% 
+      crop(scdbb)
+    
+    ### capture the 70th 
+    twipval <- quantile(twi,0.3, na.rm=TRUE)
+    
+    twi[twi < twipval] <-NA
+    
+    twirc <- twi
+    twirc[twirc >0] <- 1
+    
+    #### arriving at slope < 0.5degrees
+    
+    slope <- raster("./Phase2/slope.tif") %>% 
+      crop(scdbb)
+    
+    slope[slope>0.5] <- NA
+    slope[slope>0] <- 1
+    
+    #### combining slope and twi to arrive at wet ground areas
+    
+    twislp <- twirc+slope
+    twislp[twislp <2] <- NA
+    twislp[twislp>0] <- 1
+    
+    writeRaster(twislp, "./Markdown/Phase2/twislp.tif")
+  
+  ### Stage 3 - combining with all water/wet ground indicator rasters ----
+    
+    print ("Combined water/wet ground dataset not present - proceeding to construct")
+    
+    #### combining with all water/wet ground indicator rasters
+    
+    lcmrc2 <- aggregate(disaggregate(lcmrc, fact = 2),fact=5)
+    
+    ### combine watercourse datset with lcm wet habitats
+    
+    origin(lcmrc2) <- origin(oswat)
+    
+    waterhabs <- mosaic(oswat, disaggregate(lcmrc2, fact=2), fun = "max")
+  
+  
+  origin(waterhabs) <- origin(twislp)
+  
+  wetr <- raster::mosaic(disaggregate(twislp,fact=2), waterhabs, fun = "max")
+  wetr[wetr > 0] <- 1
+  wetr[wetr==0] <- NA
+  
+  ### sense check
+  
+  writeRaster(wetr, "./Markdown/Phase2/microhab_wetgroundR.tif",overwrite=TRUE)
+  
+  
+  # Stage 4 -  SMR - wet and very wet categories ----
+    
+    smrx <-raster("C:/Users/44754/Documents/R/FR_work/FLS_bio_indicator/fls_wd_biodiversity_indicator/FLS_bioD_indicator/S_Bath_ESCdata/ESC_rasters/smr250v2.tif") %>% crop(scdbb)
+    
+    ### Filtering SMR dataset to keep only wet and very wet categories
+    
+    smrx[smrx<7] <- NA
+    
+    #### merge this with the latest wetground raster dataset
+    
+    smrx2 <- crop(smrx, scdbb) %>% resample(wetr, method = "ngb")
+    
+    origin(wetr) <- origin(oswat)
+    
+    origin(smrx2) <- origin(oswat)
+    
+    wetr2 <- merge(smrx2, wetr, oswat)
+    
+    wetr2[wetr2>0] <- 1
+    
+    writeRaster(wetr2, "./Markdown/Phase2/microhab_wetground_final_R.tif", overwrite=TRUE)
+  
+  
+  
+  # Stage 5 - woodland types classification data ----
+  
+  ### Woodland stands with wet woodland NVC types and overlap with wet TWI category.
+    
+    print ("Weet woodland dataset not present - proceeding to construction")
+    
+    
+    rstptsx <- as(rstpts, "Spatial") %>% as.data.frame() %>% rename(x = coords.x1, y = coords.x2)
+    
+    ### import region-specific woodland type results
+    
+    wdtypes <- readRDS(paste0("./Results/Region_", a, "/wdtypes.RData"))
+    
+    wdtypesx <- wdtypes[[1]] %>% dplyr::select(SCOBJECTID, spis.x, prim_code) %>% filter(prim_code %in% c("I2", "G1"))
+    
+    wetdf <- data.frame(SCOBJECTID = unique(wdtypesx$SCOBJECTID))
+    
+    
+    #### Importing woodland based scdb pts dataset.
+    
+    scdbpts <- rstptsx %>% inner_join(wetdf, by = "SCOBJECTID")
+    
+    ### extract values from TWI raster
+    
+    twiext <- data.frame(twi = raster::extract(twirc, dplyr::select(scdbpts, c("x", "y"))))
+    
+    ### join back to scdbpts object
+    
+    wetpts <- cbind(scdbpts, twiext)
+    
+    ### join back to wdtypesx object
+    
+    wdtypesx2 <- wdtypesx %>% left_join(dplyr::select(wetpts, c("SCOBJECTID", "twi" )), by = "SCOBJECTID") %>% 
+      mutate(check = ifelse(prim_code %in% c("G1") & twi == 1, 1, 2)) %>% filter((is.na(check) & !(prim_code %in% c("G1"))) | check == 1)
+    
+    wdtypesxfin <- wdtypesx2 %>% group_by(SCOBJECTID) %>% summarise(count=n())
+    
+    #### join back to spatial dataset - woodland one
+    
+    wetwoodfin <- scdb %>%
+      inner_join(wdtypesxfin, by = "SCOBJECTID") %>% st_cast("MULTIPOLYGON")
+    
+    st_write(wetwoodfin, "./Markdown/Phase2/Wetwood_R.shp", delete_layer=TRUE)
+    
+    #### fasterize wet woodland polygons and merge with latest wet ground microhabitat raster dataset
+    
+    wetwdr <- fasterize(wetwoodfin, wetr2)
+    
+    origin(wetwdr) <- origin(wetr2)
+    
+    wetr2 <- merge(wetr2, wetwdr)
+    
+    writeRaster(wetr2, "./Markdown/Phase2/microhab_wetground_final_R.tif", overwrite=TRUE)
+  
+  
+  # Stage 6-  Assigning wetground status to overlapping PFE woodland polygons ----
+  
+  #### Use scdbpts datasets to extract raster values directly then dissolve by SCOBJECTID value (scdballpts dataset)
+  
+  #### Focusing on region 1
+  
+  scdbpts <- rstptsx %>%   mutate(xid = paste0(x, "_", y)) %>% 
+    group_by(xid) %>% summarise(SCOBJECTID= first(SCOBJECTID), X = first(x), Y = first(y))
+  
+  ### extraction operation
+  
+  waterext <- data.frame(SCOBJECTID = scdbpts$SCOBJECTID, wet = raster::extract(wetr2, dplyr::select(scdbpts, c("X","Y"))))
+  
+  #waterext <- data.frame(SCOBJECTID = scdbpts$SCOBJECTID, wet = raster::extract(wetr2, dplyr::select(scdbpts, c("X","Y")), buffer = 25, fun = max, na.rm=FALSE))
+  
+  #### Aggregate by SCOBJECTID summing the wetr2 extract values + Keep all SCOBJECTIDs with final summed values > 0/NA
+  
+  waterext2 <- waterext %>% mutate(wet = ifelse(is.na(wet), 0, wet)) %>% group_by(SCOBJECTID) %>% summarise(wet = sum(wet)) %>% filter(wet>0) %>% 
+    mutate(wet = 1)
+  
+  #### export wet ground dataframe dataset
+  
+  saveRDS(waterext2, "./Markdown/Phase2/water_wetgroundresultsR.RData")
+  
+  ### join back to scdb (woodland + open) polygon dataset
+  
+  scdbres <- scdb %>% 
+    inner_join(waterext2, by = "SCOBJECTID")
+  
+  saveRDS(scdbres, "./Markdown/Phase2/scdb_wetground_R.RData")
+  
+  return(waterext2)
+  
+}
+
+
+```
+
+```{r echo = F, eval = T, warning = F, fig.cap = "Examples of input layers used to construct water/wet ground microhabitat - Slide A: TWI", out.width="75%"}
+
+
+wettwi <- raster("./Markdown/Phase2/twislp.tif")
+
+plot(wettwi)
+plot(st_geometry(scdb), add=TRUE)
+
+```
+
+```{r echo = F, eval = T, warning = F, fig.cap = "Examples of input layers used to construct water/wet ground microhabitat - Slide B: LCM", out.width="75%"}
+
+
+wetlcm <- raster("./Markdown/Phase2/lcmrc.tif")
+
+plot(wetlcm)
+plot(st_geometry(scdb), add=TRUE)
+
+```
+
+
+```{r echo = F, eval = T, warning = F, fig.cap = "Areas of water and wet ground microhabitat", out.width="75%"}
+
+
+water <- as.data.frame(readRDS("./Markdown/Phase2/scdb_wetground_R.RData")) %>% dplyr::select(-c(geometry))
+
+waterx <- scdb %>% inner_join(water, by = "SCOBJECTID")
+
+plot(st_geometry(scdb))
+plot(st_geometry(waterx), col="red", add=TRUE)
+
+```
+
+## Stage 3.6 - scrub/edge microhabitat
+
+### Part 1 - hard edge
+
+For this microhabitat we looked to identify areas of woodland that had a 'hard edge' as well as understorey components that corresponded with scrub-type vegetation.  To pick out areas of scrub we used the NFI IFT dataset to isolate areas of IFT type "scrub", then converted these to raster format then finally to individual points.  These points were then used in a raster::extract operation to see if any overlapped with the sub-compartment stands (converted to raster format for this exercise).  For areas of hard edge used a custom function which started by running a focal statistics operation to identify areas of edge around each block woodland stand.  The results from this exercise were then extracted to each sub-compartment via a point dataset which was then used to assess which stands had any positive edge matches.  These results were then combined with the separate scrub assessment to arrive at the final reas of scrub/edge habitat.
+
+```{r echo = T, eval = F}
+
+##### Woodland edge/scrub microhabitat module ####
+
+edgefunc <- function(a, scdb){
+  
+  scdbb <- st_buffer(scdb, 2000) %>% st_union() %>% st_as_sf()
+  
+  #### generate hard edge dataset using SCDB and NFI data
+  
+  nfishrub <- st_read("./NFI_woodland_Scotland2018.shp") %>% 
+    filter(IFT_IOA %in% c("Shrub")) %>% mutate(rastval = 1)
+  
+  #### import previously constructed aggregated woodland raster
+  
+  wdagg <- raster("./NFIsc_agg_August2020.tif") %>% crop(scdbb)
+  wdagg[wdagg>0] <- 1
+  wdagg[wdagg !=1] <- NA
+  
+  #### fasterize the new shrub nfi subset and merge with wdagg
+  
+  nfishr <- fasterize(nfishrub,wdagg, field = "rastval") %>% crop(scdbb)
+  nfishr[nfishr !=1] <- NA
+  
+  woodshr <- mosaic(wdagg, nfishr, fun = "max")
+  
+  writeRaster(nfishr, "./Markdown/Phase2/nfishrub.tif", overwrite=TRUE)
+  
+  ### Import target sub-compartment dataset ####
+  
+  wdblkbound <- scdb %>% group_by(blk) %>% summarise(count=n())
+  
+  saveRDS(wdblkbound, "./Markdown/Phase2/wdblkbound_Region.RData")
+  
+  
+  edgefunc <- function(a,b,c){
+    
+    #### function to generate points that represent hard edges of existing woodland
+    
+    print(paste0("blk id = ", b))
+    
+    scdbx <- a[a$blk %in% c(b),] %>% group_by(blk) %>% summarise(count= n()) %>% st_buffer(500)
+    
+    woodrast <- crop(c,scdbx)
+    
+    fw <- focalWeight(woodrast, 50, "circle")
+    
+    print("focal statistics analysis")
+    
+    richness <- function(x){
+      length(unique(x))
+      
+    }
+    
+    richoutx <- focal(woodrast,fw, fun=richness, pad=T)
+    
+    m <- c(0, 2,  NA, 3, 3, 1,  4, Inf, NA)
+    rclmat <- matrix(m, ncol=3, byrow=TRUE)
+    
+    richoutx2 <- reclassify(richoutx, rclmat)
+    
+    #woodrast[woodrast>0] <- -9999
+    
+    #rastcmb <- raster::merge(woodrast, richoutx2)
+    
+    #rastcmb[rastcmb == -9999] <- NA
+    
+    rpts <- rasterToPoints(richoutx2,spatial = TRUE) %>% as.data.frame() %>% dplyr::select(x,y)
+    
+    scdbx2 <- a[a$blk %in% c(b),] %>% st_cast("MULTIPOLYGON") %>% fasterize(disaggregate(woodrast,fact=5), field = "SCOBJECTID")
+    
+    dfin <- data.frame(SCOBJECTID = raster::extract(scdbx2,rpts))
+    dfin <- data.frame(SCOBJECTID = unique(dfin$SCOBJECTID), hardedge = 1)
+    
+    return(dfin)
+    
+    
+  }
+  
+  rptsx <- mapply(edgefunc, list(scdb), as.list(unique(as.character(scdb$blk))), list(woodshr), SIMPLIFY = FALSE)
+  
+  rptsx <- plyr::compact(rptsx)
+  
+  ptsfin <- do.call(rbind,rptsx) %>% 
+    group_by(SCOBJECTID) %>% summarise(hardedge = first(hardedge))
+  
+  #### join back to original scdb dataset ####
+  
+  scdbout <- scdb %>% left_join(ptsfin, by = "SCOBJECTID") %>% 
+    mutate(hardedge = ifelse(is.na(hardedge), 0, hardedge))
+  
+  
+  #### Export for sense checking ###
+  
+  saveRDS(scdbout, "./Markdown/Phase2/scdbout.RData")
+  
+  
+  ####create separate raster layer comprised of NFI shrub within PFE woodland #####
+  
+  ### Mask nfishr to wdblkbound 
+  
+  scdb_shrub <- crop(nfishr, wdblkbound)
+  shrubpts <- rasterToPoints(scdb_shrub,Spatial=TRUE) %>% 
+    as.data.frame()
+  
+  #### Creating subset of scdbs which intersect NFI shrub areas #####
+  
+  scdbr <- fasterize(st_cast(scdb, "MULTIPOLYGON"),disaggregate(wdagg,5), field="SCOBJECTID")
+  
+  sptsext <- data.frame(SCOBJECTID = raster::extract(scdbr, dplyr::select(shrubpts, c("x","y")))) %>% 
+    filter(!is.na(SCOBJECTID))
+  
+  shrubscdb <- data.frame(SCOBJECTID = unique(sptsext$SCOBJECTID)) %>% mutate(nfishrub = 1)
+  
+  #### join back to main scdbout dataset
+  
+  scdbout <- readRDS("./Markdown/Phase2/scdbout.RData")
+  
+  scdbout2 <- scdbout %>% left_join(shrubscdb, by = "SCOBJECTID") %>% 
+    mutate(woodedgesc = ifelse(hardedge == 1 | nfishrub == 1, 1, 0)) %>% 
+    mutate(woodedgesc = ifelse(is.na(woodedgesc), 0, woodedgesc))
+  
+  saveRDS(scdbout2, "./scdb_escedge.RData")
+
+  
+}
+
+
+
+```
+
+```{r echo = F, eval = T, warning = F, fig.cap = "Areas of scrub/edge microhabitat - Slide A: hard edges", out.width="75%"}
+
+figx <- read.csv("./Markdown/Phase2/Fig_testarea.csv")
+
+edge <- as.data.frame(readRDS("./Markdown/Phase2/scdbout.RData")) %>% dplyr::select(-c(geometry)) %>% 
+  inner_join(figx,by="SCOBJECTID")
+
+edgex <- scdb %>% inner_join(edge, by = "SCOBJECTID") %>% filter(hardedge ==1)
+
+plot(st_geometry(edgex), col="red")
+plot(st_geometry(scdb), add=TRUE)
+
+```
+
+```{r echo = F, eval = T, warning = F, fig.cap = "Areas of scrub/edge microhabitat - Slide B: final edge areas", out.width="75%"}
+
+scrub <- as.data.frame(readRDS("./Markdown/Phase2/scdb_escedge.RData")) %>% dplyr::select(-c(geometry))
+
+scrubx <- scdb %>% inner_join(scrub, by = "SCOBJECTID") %>% filter(hardedge ==1)
+
+plot(st_geometry(scdb))
+plot(st_geometry(scrubx), col="red", add=TRUE)
+
+```
+
+## Stage 3.6 - scrub/edge microhabitat
+### Part 2 - scrub
+
+For areas of scrub we ran an analysis to identify areas of low yield class or poor quality as defined in the Ecological Site Classification framework.  This involved iterating over each of the main tree species groups and for each one identifying where sites of low YC/poor quality occur and seeing what stands overlap with these areas.  The results from this process were then combined wtih those from part 1 to arrive at the final stands that satisfy the scrub and edge criteria for this microhabitat type.
+
+
+```{r echo = T, eval = F}
+
+scrubfunc <- function(a, scdb){
+  
+  scdbb <- st_buffer(scdb, 2000) %>% st_union() %>% st_as_sf()
+
+  comp <- readRDS("./Markdown/Phase2/comp.RData") %>% dplyr::select(c(SCOBJECTID, spis))
+  
+  scdbpts <- readRDS("./Markdown/Phase2/rstpts.RData") %>% as("Spatial") %>% as.data.frame() %>% 
+    rename(x = coords.x1, y = coords.x2) %>% left_join(comp, by = "SCOBJECTID")
+  
+  brdlst <- read.csv("./spislist.csv") %>% 
+    filter(Type %in% "brd")
+  
+  ### low YC/poor quality/marginal sites
+  
+  ### Using modified version of initial ESC raster processing script from main analysis
+  
+  setwd("C:/Users/44754/Documents/R/FR_work/FLS_bio_indicator/fls_wd_biodiversity_indicator/FLS_bioD_indicator/S_Bath_ESCdata/ESC_rasters")
+  
+  CT<-raster("ct.tif") %>% crop(scdbb)
+  DAMS<-raster("dams.tif")%>% crop(scdbb)
+  SMR<-raster("smr250v2.tif")%>% crop(scdbb)
+  SNR<-raster("snr250v2.tif")%>% crop(scdbb)
+  
+  setwd("..")
+  parameters<-read.csv("./csv_files/esccoeffs3.5.csv")
+  Species<-  paste(parameters[,1])
+  
+  modlst <- c("SS", "DF", "ESF", "GF", "NF", "WH", "NS", "RC")
+  
+  
+  ### Extent conflict between smr/snr rasters and other datasets
+  
+  SMR <- projectRaster(SMR, CT, method="ngb")
+  SNR <- projectRaster(SNR, CT, method = "ngb")
+  
+  
+  
+  #### Setting up region-specific esc raster folder #####
+  
+  escrstfold <- paste0("./ESC_modeldata/Region_", a)
+  
+  
+  listf <- list.files(escrstfold)
+  
+  dams <- raster("C:/Users/44754/Documents/R/FR_work/FLS_bio_indicator/fls_wd_biodiversity_indicator/FLS_bioD_indicator/S_Bath_ESCdata/ESC_rasters/dams.tif")
+  
+  dams[dams<=18] <- NA
+  
+  #### Extract Dams value first from entire point dataset
+  
+  dfdam <- data.frame(dam = raster::extract(dams, dplyr::select(scdbpts, c("x","y"))))
+  
+  ### join back to latest dataset
+  
+  scdbpts <- cbind(scdbpts, dfdam) %>% filter(spis %in% unique(brdlst$species))
+  
+  
+  
+  
+  ### process rows with modified species separately from the rest
+  
+  ### check for presence of SMR/SNR rasters - not all species are guaranteed to be in a particular regions dataset
+  
+  ### First filter dataset to keep only the modified tree spp.
+  
+  scdbmod <- scdbpts %>% filter(spis %in% modlst)
+  
+  ptslist <- list()
+  
+  for(i in 1:length(modlst)) {
+    
+    SMRx <- raster(paste0(escrstfold, "/SMR", modlst[[i]], ".tif"))
+    SNRx <- raster(paste0(escrstfold, "/SNR", modlst[[i]], ".tif"))
+    
+    scdbptsx <- scdbmod %>% filter(spis %in% c(modlst[i]))
+    
+    dfsmrx <- data.frame(SMR = raster::extract(SMRx, dplyr::select(scdbptsx, c("x","y"))))
+    dfsnrx <- data.frame(SNR = raster::extract(SMRx, dplyr::select(scdbptsx, c("x","y"))))
+    
+    dfinx <- cbind(dfsmrx,dfsnrx)
+    
+    dfin <- cbind(scdbptsx, dfinx)
+    
+    ptslist[[i]] <- dfin
+    
+    
+  }
+  
+  ptslistx <- plyr::compact(ptslist)
+  
+  ptslistfin <- do.call(rbind,ptslistx)
+  
+  scdbmodfin <- ptslistfin %>% filter(!is.na(SMR) |!is.na(SNR) | !is.na(dam))
+  
+  
+  
+  
+  ### All other tree species types
+  
+  SMRx <- SMR
+  SNRx <- SNR
+  
+  scdbrest <- scdbpts %>% filter(!spis %in% modlst)
+  
+  ### SMR first
+  
+  ### Reclassify to keep only cells with SMR<7 - so only wet categories
+  
+  SMRx[SMRx<7] <- NA
+  
+  ### Then SNR - keep only poor/very poor classes
+  
+  SNRx[SNRx>2] <- NA
+  
+  ### Extraction operation
+  
+  ### SMR first
+  
+  dfsmr <- data.frame(SMR = raster::extract(SMRx, dplyr::select(scdbrest, c("x","y"))))
+  
+  dfsnr <- data.frame(SNR = raster::extract(SNRx, dplyr::select(scdbrest, c("x","y"))))
+  
+  ### combine results
+  
+  dfinall <- cbind(dfsmr,dfsnr)
+  
+  #### merge back with point dataset
+  
+  scdbrestfin <- cbind(scdbrest,dfinall) %>% filter(!is.na(SMR) |!is.na(SNR) | !is.na(dam))
+  
+  
+  #### combine all results
+  
+  resfin <- rbind(scdbrestfin, scdbmodfin)
+  
+  #### join to polygon result dataset
+  
+  setwd("C:/Users/44754/Documents/R/FR_work/FLS_bio_indicator/fls_wd_biodiversity_indicator/FLS_bioD_indicator")
+  
+  scdbfin <- scdb %>% inner_join(dplyr::select(resfin,c("SCOBJECTID")),by="SCOBJECTID") %>% group_by(SCOBJECTID) %>% summarise(escscrub = 1)
+  
+  saveRDS(scdbfin, "./Markdown/Phase2/scdbfin.RData")
+  
+  
+  ### combine ESC and hard edge results
+  
+  scedge <- as.data.frame(scdbfin) %>% mutate(scedge = 1) %>% dplyr::select(SCOBJECTID, scedge)
+  
+  hardedge <- as.data.frame(readRDS("./Markdown/Phase2/scdb_escedge.RData")) %>% mutate(scedge = ifelse(woodedgesc == 1, 1, 0)) %>% dplyr::select(SCOBJECTID, scedge) %>% 
+    filter(scedge>0)
+  
+  scedgefin <- rbind(scedge,hardedge) %>% group_by(SCOBJECTID) %>% summarise(scedge = max(scedge))
+  
+  saveRDS(scedgefin, "./scrub_edge_fin_Region.RData")
+  
+  return(scedgefin)
+  
+}
+
+
+```
+
+
+```{r echo = F, eval = T, warning = F, fig.cap = "Areas of scrub/edge microhabitat - Part 2 - scrub areas", out.width="75%"}
+
+scrub <- as.data.frame(readRDS("./Markdown/Phase2/scrub_edge_fin_Region.RData"))
+
+scrubx <- scdb %>% inner_join(scrub, by = "SCOBJECTID") %>% filter(scedge ==1)
+
+plot(st_geometry(scdb))
+plot(st_geometry(scrubx), col="red", add=TRUE)
+
+```
+
+## Stage 3.7 - Dry bark
+
+Areas of dry bark are identified through first isolating stands with a "hard edge" as defined in the previous analysis.  Next, areas of suitable aspect are identified using a pre-generated aspect raster.  Both these datasets are then combined with a final dataset comprised of the bottom 10% decile of TWI values.  A raster extract operation is then used to identify which sub-compartments overlap wiith these areas defined as suitable for this microhabitat class.
+
+
+```{r echo = T, eval = F}
+
+## Tree dry bark ----
+
+### a = fls region id
+
+treedryfunc <- function(a, scdb){
+
+  scdbedge <- readRDS("./Markdown/Phase2/scdb_escedge.RData")
+  
+  #### subset to keep only those with confirmed hard edge
+  
+  scdbedge <- scdbedge %>% filter(hardedge == 1)
+  
+  saveRDS(scdbedge, "./Markdown/Phase2/scdbedge.RData")
+  
+  #### Import aspect raster
+  
+  scdbb <- st_buffer(scdb, 2000) %>% st_union() %>% st_as_sf()
+  
+  asp <- raster("./Phase2/Aspect_Scotland.tif") %>% 
+    crop(scdbb)
+  
+  m <- c(-Inf, 134.9, NA, 135, 225.9, 1, 226, Inf, NA)
+  
+  rclmatS <- matrix(m, ncol=3, byrow=TRUE)
+  
+  asprcS <- reclassify(asp, rclmatS)
+  
+  asprcS[asprcS>0] <- 1
+  
+  #### Capturing bottom decile of twi ###
+  
+  ### constructing twi percentile raster ####
+  
+  twi <- raster("./Phase2/TWI_UK.tif") %>% 
+    crop(scdbb)
+  
+  twipval <- quantile(twi,0.1, na.rm=TRUE)
+  
+  twirc <- twi
+  twirc[twirc >twipval] <- NA
+  twirc[twirc>0] <- 1
+  
+  #### combine aspect and twi rasters - mosaic operation
+  
+  origin(asprcS) <- origin(twirc)
+  
+  toporast <- mosaic(asprcS,twirc, fun = "sum")
+  toporast[toporast != 2] <- NA
+  
+  saveRDS(toporast, "./Markdown/Phase2/dry_toporast_R.RData")
+  
+  writeRaster(toporast, "./Markdown/Phase2/drybark_rasterR.tif", overwrite=TRUE)
+  
+  
+  ### convert scdbedge object to raster format
+  
+  scdbedger <- fasterize(st_cast(scdbedge, "MULTIPOLYGON"),twi, field = "SCOBJECTID") %>% 
+    rasterToPoints(Spatial = TRUE) %>% 
+    as.data.frame() %>% 
+    rename(SCOBJECTID = layer)
+  
+  scdbrids <- data.frame(SCOBJECTID = unique(scdbedger$SCOBJECTID), scdbedger = 1)
+  
+  ### highlight scdbs without 50m points
+  
+  scdbid <- scdbedge %>% left_join(scdbrids, by = "SCOBJECTID") %>% 
+    filter(is.na(scdbedger)) %>% 
+    st_centroid() %>% as("Spatial") %>% as.data.frame() %>% 
+    rename(x = coords.x1, y = coords.x2) %>% 
+    dplyr::select(SCOBJECTID, x, y)
+  
+  scdbpts <- rbind(scdbedger,scdbid) %>% mutate(ptid = seq.int(nrow(.)))
+  
+  ##### raster extract operation to extract raster values from toporast object 
+  
+  scdbext <- data.frame(SCOBJECTID = scdbpts$SCOBJECTID, rastval = raster::extract(toporast, dplyr::select(scdbpts, c("x","y")))) %>% 
+    filter(!is.na(rastval))
+  
+  scdbext2 <- data.frame(SCOBJECTID = unique(scdbext$SCOBJECTID), drybark = 1)
+  
+  #### join back to original scdbedge dataset
+  #### Assign final drybark values of 1 if scdb edge polygon that also satisfies the topology criteria
+  
+  drybark <- scdbedge %>% left_join(scdbext2, by = "SCOBJECTID") %>% 
+    mutate(drybark = ifelse(is.na(drybark), 0, drybark))
+  
+  saveRDS(drybark, "./Markdown/Phase2/drybark_R.RData")
+  
+  return(drybark)
+  
+}
+
+
+```
+
+```{r echo = F, eval = T, warning = F, fig.cap = "Areas of dry bark microhabitat", out.width="75%"}
+
+drybark <- as.data.frame(readRDS("./Markdown/Phase2/drybark_R.RData"))
+
+scdbdry <- scdb %>% inner_join(drybark, by = "SCOBJECTID") %>% filter(drybark ==1)
+
+plot(st_geometry(scdb))
+plot(st_geometry(scdbdry), col="red", add=TRUE)
+
+```
+
+
+## Stage 3.8 - Wet bark
+
+For the wet bark microhabitat we selected for stands which satisfied the following three key criteria:
+
+i) Aspect within the two ranges 315 to 360, and 0 to 45 degrees
+ii) Slope < 0.5 degrees and top 7 deciles of twi (same as wetground criteria)
+iii) Within 25m of inland water/wet habitats
+
+For aspect, a GB aspect raster (FR-developed) was reclassified to ensure that all cells with values within the two given ranges are assigned a value of 1 and all else a value of NA.  The slope and twi combined layer was constructed in the previous water/wet ground microhabitat workflow.  For the final criteria shown here we identified all stands which lay within 25m of any area denoted by a raster showing all wetground/waterbodies in the study area (developed during water/wet ground microhabitat workflow).  All these individual layers were then combined to form the final dataset showing areas eligible for the wetbark classification.
+
+```{r echo = T, eval = F}
+
+### Inputs: a = FLS region, b = fls boundary
+
+## Part 1 - aspect criteria ---
+
+  scdbb <- st_buffer(scdb, 2000) %>% st_union() %>% st_as_sf()
+  
+  asp <- raster("./Phase2/Aspect_Scotland.tif") %>% 
+    crop(scdbb)
+  
+  m <- c(45, 314.99, NA, 315, 360, 1, 0, 45, 1)
+  
+  rclmatN <- matrix(m, ncol=3, byrow=TRUE)
+  
+  asprcN <- reclassify(asp, rclmatN)
+  
+  asprcN[asprcN!=1] <- NA
+  
+  
+  #### OR - 
+  
+## Part 2 - slope/twi components ---
+  
+  ### slope < 0.5 degrees and top 7 deciles of twi (same as wetground criteria)
+  
+  twislp <- raster("./Markdown/Phase2/twislp.tif")
+  
+  
+  #### combine topographic criteria into single raster
+  
+  origin(asprcN) <- origin(twislp)
+  
+  humidr <- mosaic(asprcN, twislp, fun="max")
+  
+  #saveRDS(humidr,paste0("./Phase2/Results/Region_", a, "/wetbark_topo.RData"))
+  
+  scdbr <- fasterize(st_cast(scdb,"MULTIPOLYGON"), twislp, field="SCOBJECTID") %>% 
+    rasterToPoints(spatial = TRUE) %>% as.data.frame() %>% 
+    rename(SCOBJECTID = layer)
+  
+  scdbrids <- data.frame(SCOBJECTID = unique(scdbr$SCOBJECTID), scdbr = 1)
+  
+  ### highlight scdbs without 50m points
+  
+  scdbid <- scdb %>% left_join(scdbrids, by = "SCOBJECTID") %>% 
+    filter(is.na(scdbr)) %>% 
+    st_centroid() %>% as("Spatial") %>% as.data.frame() %>% 
+    rename(x = coords.x1, y = coords.x2) %>% 
+    dplyr::select(SCOBJECTID, x, y)
+  
+  #### combine both point datasets
+  
+  scdbpts <- rbind(scdbr,scdbid) %>% mutate(ptid = seq.int(nrow(.)))
+  
+  sptsext <- data.frame(ptid = scdbpts$ptid, humidval = raster::extract(humidr, dplyr::select(scdbpts, c("x","y")))) %>% 
+    filter(!is.na(humidval))
+  
+  scdbpts <- scdbpts %>% left_join(sptsext, by = "ptid") %>% mutate(humidval = ifelse(is.na(humidval), 0, humidval)) %>% 
+    group_by(SCOBJECTID) %>% summarise(humidsum = sum(humidval)) %>% 
+    mutate(humidfin = ifelse(humidsum>0, 1, 0)) %>% 
+    as.data.frame()
+  
+  scdbptsx <- scdbpts %>% filter(humidfin == 1)
+  saveRDS(scdbptsx, "./Markdown/Phase2/scdbpts_pt1.RData")
+  
+  
+  
+  
+  ### Part 3 - OR within 25m of inland water/wet habitats ---
+  
+  #### distance calculation function
+  
+  ###Iterate over each main blk, within each block crop the 50m combined watercourse wetland raster to the blk extent then convert to points
+  ### next identify which scdb polygons lie within 25m of these watercourse points - keep only the ones that fall within this distance.
+  ### move onto the next blk id.
+  
+  ### Need to construct woodland block boundary polygon datasets using all sub-compartments (woodland/open)
+  
+  #wdblkbound <- readRDS(paste0("./Results/Region_", a, "/scdbblk.RData"))
+  
+  wdblkbound <- scdb %>% group_by(blk) %>% summarise(count= n())
+  
+  wdblkbound2 <- wdblkbound %>% mutate(blkid3 = seq.int(nrow(.)))
+  
+  scdb2 <- scdb %>% group_by(SCOBJECTID) %>% summarise(blk = first(blk)) %>% 
+    left_join(dplyr::select(as.data.frame(wdblkbound2), -c("geometry")), by = "blk") %>% 
+    arrange(blkid3)
+  
+  
+  waterhabs <- raster("Markdown/Phase2/microhab_wetground_final_R.tif")
+  
+  distcalc <- function(waterhabs, b, d){
+    
+    ### waterhabs = river+wetland raster areas, b = blkid3 value, c = wdblkbound2 dataset, d = scdb dataset
+    
+    print(paste0("blkid3: ", b, "Percentage complete:", b/length(unique(d$blkid3))))
+    
+    #### focal patch
+    
+    focpat <- d[d$blkid3 ==b,]
+    
+    focb <- focpat %>% group_by(blkid3) %>% summarise(count=n()) %>% st_buffer(30)
+    
+    ### crop the watercourse raster dataset (waterhabs)
+    
+    wtrast <- crop(waterhabs,focb) %>% mask(focb)
+    
+    #### convert raster to points
+    
+    wtrpts <- rasterToPoints(wtrast, spatial = TRUE) %>% 
+      st_as_sf() %>% 
+      group_by(microhab_wetground_final_R) %>% summarise(count=n())
+    
+    if(nrow(wtrpts)==0){
+      
+      print("No water features within 25m buffer distance")
+      
+      return()
+      
+    }
+    
+    st_crs(wtrpts) <- st_crs(focpat)
+    
+    distx <- st_is_within_distance(focpat, wtrpts, 25)
+    
+    distx2 <- as.matrix(distx) %>% as.data.frame()
+    
+    if (nrow(distx2)==0){
+      
+      print("no stands within 25m of water features")
+      
+      return()
+      
+    }
+    
+    distx2 <- distx2 %>% 
+      mutate(id3 = seq.int(nrow(.))) %>% 
+      filter(V1 %in% c("TRUE"))
+    
+    ### join back to current focal patch subset
+    
+    focpat2 <- as.data.frame(focpat) %>% mutate(id3 = seq.int(nrow(.))) %>% inner_join(distx2, by = "id3") %>% 
+      dplyr::select(SCOBJECTID, blk, V1)
+    
+    return(focpat2)
+    
+  }
+  
+  cdist3_2 <- mapply(distcalc, list(waterhabs), as.list(unique(scdb2$blkid3)), list(scdb2), SIMPLIFY = FALSE)
+  
+  distout <- plyr::compact(cdist3_2)
+  distout <- do.call(rbind, distout)
+  
+  #### join with above scdbpts dataframe
+  
+  humidfin <- scdbpts %>% left_join(distout, by = "SCOBJECTID") %>% 
+    mutate(V1 = ifelse(is.na(V1), 0, V1)) %>% 
+    mutate(treebarkh = ifelse(humidfin == 1 | V1 %in% c("TRUE"), 1, 0))
+  
+  ### Final aggregation to sub-compartment scale
+  
+  humidfin2 <- humidfin %>% group_by(SCOBJECTID) %>% summarise(treebarkh = max(treebarkh))
+  
+  saveRDS(humidfin2, "./Markdown/Phase2/humidfin.RData")
+  
+  return(humidfin2)
+  
+}
+
+```
+
+```{r echo = F, eval = T, warning = F, fig.cap = "Areas of wet bark microhabitat - Part 1 - aspect/slope/twi criteria", out.width="75%"}
+
+wetbark <- as.data.frame(readRDS("./Markdown/Phase2/scdbpts_pt1.RData")) %>% group_by(SCOBJECTID) %>% summarise(count=n())
+
+scdbwet <- scdb %>% inner_join(wetbark, by = "SCOBJECTID")
+
+plot(st_geometry(scdb))
+plot(st_geometry(scdbwet), col="red", add=TRUE)
+
+```
+
+```{r echo = F, eval = T, warning = F, fig.cap = "Areas of wet bark microhabitat - Part 2 - final wet bark stands", out.width="75%"}
+
+wetbarkf <- as.data.frame(readRDS("./Markdown/Phase2/humidfin.RData")) %>% filter(treebarkh == 1)
+
+scdbwetf <- scdb %>% inner_join(wetbarkf, by = "SCOBJECTID")
+
+plot(st_geometry(scdb))
+plot(st_geometry(scdbwetf), col="red", add=TRUE)
+
+```
+
+## Stage 3.9 - Dry rock
+
+For dry rock microhabitats we first took a UK soils composite dataset comprised of ground data from FC and aerial imagery analysis by CEH.  We used this dataset to arrive at a subset of the country comprised of rocky soils.  This was then used along with the previously generated Northerly aspect and dry twi dataset (produced during the drybark analysis) to arrive at final areas of dry rock.
+
+
+```{r echo = T, eval = F}
+
+  scdbb <- st_buffer(scdb, 2000) %>% st_union() %>% st_as_sf()
+  
+  rock <- st_read("./Phase2/Rocky_soils_Scotland.shp")
+  
+  ### import template raster
+  
+  temp <- raster("./Markdown/Phase2/microhab_wetground_final_R.tif")
+  
+  ## Stage 1 - Dry rock ----
+  
+  #### create raster version of rocky soils dataset
+  
+  rockr <- fasterize(rock, aggregate(temp, fact=2))
+  
+  ### crop rock raster by current fls region
+  
+  rockr2 <- crop(rockr,scdbb)
+  
+  #### Import Northernly aspect and dry twi decile data from dry bark module
+  
+  drytopo <- readRDS("./Markdown/Phase2/dry_toporast_R.RData")
+  drytopo[drytopo>0] <- 1
+  
+  #### Combine all raster datasets in AND condition assessment
+  
+  origin(drytopo) <- origin(rockr2)
+  
+  rockdry <- mosaic(drytopo, rockr2, fun="sum")
+  
+  ### Keep only cells with value 2 ("AND")
+  
+  rockdry[rockdry !=2] <- NA
+  
+  #### extracting dry rock raster data to scdbpts objects
+  
+  scdbpts <- rstpts %>% st_coordinates() 
+  
+  scdbpts <- cbind(rstpts, scdbpts)
+
+  scdbpts2 <- scdbpts %>% 
+    mutate(xid = paste0(X, "_", Y)) %>% 
+    group_by(xid) %>% summarise(SCOBJECTID= first(SCOBJECTID), X = first(X), Y = first(Y)) %>% mutate(ptid = seq.int(nrow(.)))
+  
+  ### extraction operation
+  
+  dryrockext <- data.frame(SCOBJECTID = scdbpts2$SCOBJECTID, dryr = raster::extract(rockdry, dplyr::select(scdbpts2, c("X","Y"))))
+  
+  #### Aggregate by SCOBJECTID summing the wetr2 extract values + Keep all SCOBJECTIDs with final summed values > 0/NA
+  
+  dryrockext2 <- dryrockext %>% mutate(dryr = ifelse(is.na(dryr), 0, dryr)) %>% group_by(SCOBJECTID) %>% summarise(dryr = sum(dryr)) %>% filter(dryr>0) %>% 
+    mutate(dryrock = 1) %>% dplyr::select(-c(dryr))
+  
+  saveRDS(dryrockext2, "./Markdown/Phase2/dryrock_extract.RData")
+  
+  scdbdryr <- scdb %>% inner_join(dryrockext2, by = "SCOBJECTID")
+  
+  saveRDS(scdbdryr, "./Markdown/Phase2/dryrock_scdb.RData")
+
+```
+
+```{r echo = F, eval = T, warning = F, fig.cap = "Areas of dry rock microhabitat", out.width="75%"}
+
+dryrockf <- as.data.frame(readRDS("./Markdown/Phase2/dryrock_scdb.RData")) %>% filter(dryrock == 1)
+
+scdbdryr <- scdb %>% inner_join(dryrockf, by = "SCOBJECTID")
+
+plot(st_geometry(scdb))
+plot(st_geometry(scdbdryr), col="red", add=TRUE)
+
+```
+
+## Stage 3.10 - Wet rock
+
+For the wet rock microhabitat we identified which stands intercepted both areas of rocky soil and wet ground as defined in the water/wet ground microhabitat analysis.
+
+```{r echo = T, eval = F}
+
+  # Stage 2 - Rock humid ----
+  
+  #### key components - i) northerly aspect, OR ii) low slope angle and within top 7 twi deciles, OR iii) within 25m of inland water/wetland habitats
+  
+  ### short-cut = import results of wetbark and identify which ones intersect rocky soils
+  
+  humbark <- readRDS("./Markdown/Phase2/humidfin.RData")
+  
+  ### extract humbark values using point dataset then join with humbark dataframe to arrive at final wetrock
+  
+  rockext <- data.frame(ptid = scdbpts2$ptid, rockval = raster::extract(rockr2, dplyr::select(scdbpts2, "X", "Y")))
+  
+  ### Join back to scdbpts dataframe
+  
+  scdbpts3 <- scdbpts2 %>% left_join(rockext, by = "ptid") %>% 
+    group_by(SCOBJECTID) %>% summarise(rockval = first(rockval))
+  
+  ### join back to humbark dataframe
+  
+  humbark2 <- humbark %>% left_join(dplyr::select(scdbpts3, c("SCOBJECTID", "rockval")), by = "SCOBJECTID") %>% 
+    mutate(rockval = ifelse(is.na(rockval), 0, rockval)) %>% 
+    mutate(rock_humid = ifelse((treebarkh == 1 & rockval ==1), 1, 0)) %>% 
+    dplyr::select(SCOBJECTID, rock_humid)
+  
+  humrock <- humbark2 %>% group_by(SCOBJECTID) %>% summarise(rock_humid = max(rock_humid))
+
+
+```
+
+```{r echo = F, eval = T, warning = F, fig.cap = "Areas of wet rock microhabitat", out.width="75%"}
+
+wetrockf <- as.data.frame(readRDS("./Markdown/Phase2/humid_rock.RData")) %>% filter(rock_humid == 1)
+
+scdbwetr <- scdb %>% inner_join(wetrockf, by = "SCOBJECTID")
+
+plot(st_geometry(scdb))
+plot(st_geometry(scdbwetr), col="red", add=TRUE)
+
+```
+
+## Stage 3.11 - Grassland + grassland mosaics ----
+
+These two microhabitats are exclusive to open woodland structure types (temporary/permanent open) and were generated by using a combination of the LCM 2019, NFI IFT and habitat survey polygon data.
+
+```{r echo = T, eval = F}
+
+## inputs - x = fls region id
+
+grassfunc <- function(x){
+  
+  #### Experimenting with methods for identifying stands with permanent open microhabitat.
+  
+  setwd("C:/Users/44754/Documents/R/FR_work/FLS_bio_indicator/fls_wd_biodiversity_indicator/FLS_bioD_indicator")
+  
+  ### First import the very first version of the scdb polygon dataset - not filtered for only woodland
+  
+  scdb <- readRDS(paste0("./masterpoints/Region_",x,"/scdb_Region_", x,".RData")) %>% 
+    mutate(blk = as.factor(paste0(cots_distr, "_", blk))) %>% 
+    group_by(SCOBJECTID) %>% summarise(blk = first(blk), template_n = first(template_n))
+  
+  
+  ### Need to select the inverse of woodland
+  
+  ## modifed component table function
+  
+  ## Select for components that don't have any woodland elements - i.e., open/unplantable ground
+  
+  compfuncx <- function(a){
+    
+    ### Import Scotland component database in .csv format
+    
+    scotcomp <- read.csv("./SCDB_Scot_componentjoin.csv") %>% 
+      rename(SCOBJECTID = OBJECTID_1)
+    
+    #### Constrain scotcomp df to FLS district region
+    
+    #### Create simple df of scdb objectid values and do appropriate join with scotcomp object to keep only those rows in 
+    #### scotcomp that correspond with the id vals in the former df.
+    
+    scdbid <-  data.frame(SCOBJECTID = unique(a$SCOBJECTID))
+    
+    comp <- scotcomp %>% 
+      
+      ## inner join here ensures that we keep only those component table rows which correspond with the sub-compartments in the current FLS region
+      
+      inner_join(scdbid, by = "SCOBJECTID") %>% 
+      mutate(blk = as.factor(paste0(cots_distr, "_", blk)))
+    
+    ##### Filter out all non-woodland rows according to the "luse" field
+    
+    ### List of acceptable luse codes
+    
+    lucod <- c("FMR", "FMS", "NAO", "PHF", "PIB", "PRP", "PSS", "PWC")
+    
+    comp<- comp %>% 
+      filter(!luse %in% lucod)
+    
+    return(comp)
+    
+    
+  }
+  
+  ### Original component function - select for components with woodland elements - use this to arrive at final sub-compartments with no woodland components
+  
+  compfuncx2 <- function(a){
+    
+    ### Import Scotland component database in .csv format
+    
+    scotcomp <- read.csv("./SCDB_Scot_componentjoin.csv") %>% 
+      rename(SCOBJECTID = OBJECTID_1)
+    
+    #### Constrain scotcomp df to FLS district region
+    
+    #### Create simple df of scdb objectid values and do appropriate join with scotcomp object to keep only those rows in 
+    #### scotcomp that correspond with the id vals in the former df.
+    
+    scdbid <-  data.frame(SCOBJECTID = unique(a$SCOBJECTID))
+    
+    comp <- scotcomp %>% 
+      
+      ## inner join here ensures that we keep only those component table rows which correspond with the sub-compartments in the current FLS region
+      
+      inner_join(scdbid, by = "SCOBJECTID") %>% 
+      mutate(blk = as.factor(paste0(cots_distr, "_", blk)))
+    
+    ##### Filter out all non-woodland rows according to the "luse" field
+    
+    ### List of acceptable luse codes
+    
+    lucod <- c("FMR", "FMS", "NAO", "PHF", "PIB", "PRP", "PSS", "PWC")
+    
+    comp<- comp %>% 
+      filter(luse %in% lucod)
+    
+    return(comp)
+    
+    
+  }
+  
+  ### Run custom component table function
+  
+  compx <- compfuncx(scdb)
+  
+  compx2 <- compfuncx2(scdb)
+  
+  ### Making tidy dataframe of sub-compartments with at least one woodland component row
+  
+  compx2df <- data.frame(SCOBJECTID = unique(compx2$SCOBJECTID)) %>% mutate(remove = 1)
+  
+  
+  ### Constructing dataframe of unique sub-compartment ids for all stands with at least one non-woodland component
+  
+  sclist <- data.frame(SCOBJECTID = unique(compx$SCOBJECTID))
+  
+  
+  
+  ### add subcs that don't correspond with component table
+  
+  comporig <- readRDS(paste0("./Results/Region_", x, "/comp.RData"))
+  comporig <- data.frame(SCOBJECTID = unique(comporig$SCOBJECTID)) %>% mutate(check = 1)
+  
+  ### Filter non woodland scdbs polygons that don't correspond with component table.
+  
+  scdbx2 <- scdb %>% 
+    left_join(comporig, by = "SCOBJECTID") %>% 
+    filter(is.na(check)) %>% 
+    as.data.frame() %>% dplyr::select(SCOBJECTID)
+  
+  ### update sclist dataframe - this represents subcompartments with at least one component of non-woodland and stands which don't correspond with any component entry.
+  
+  sclist <- rbind(sclist, scdbx2)
+  
+  
+  ## non-woodland scdb polygons - subcs with at least one component comprised of open habitat types.
+  
+  ## These correspond with stands that either have at least one component of open habitat, or don't correspond with component table period.
+  
+  scdbnonwd <- scdb %>% inner_join(sclist, by = "SCOBJECTID") %>% left_join(dplyr::select(compx, c("SCOBJECTID", "spis", "areaa", "luse", "OBJECTID")), by = "SCOBJECTID") %>% 
+    group_by(SCOBJECTID) %>% summarise(blk = first(blk), areaa = sum(areaa))
+  
+  
+  
+  ### convert resultant dataset to point format
+  
+  at <- raster("C:/Users/44754/Documents/R/FR_work/FLS_bio_indicator/fls_wd_biodiversity_indicator/FLS_bioD_indicator/S_Bath_ESCdata/ESC_rasters/at.tif") %>% 
+    crop(scdb)
+  
+  atdis <- disaggregate(at, fact=5)
+  
+  scdbr <- fasterize(st_cast(scdbnonwd, "MULTIPOLYGON"), atdis, field = "SCOBJECTID")
+  
+  # ** convert rasterized version to point dataset ----
+  
+  rstpts <- rasterToPoints(scdbr, spatial = TRUE) %>% 
+    st_as_sf() %>% 
+    rename(SCOBJECTID = layer)
+  
+  
+  
+  ### main scdb dataset dissolved to blk scale - used as raster in main analysis
+  
+  scdbx1 <- scdbnonwd %>% group_by(blk) %>% summarise(count = n()) %>% mutate(blkID = seq.int(nrow(.))) %>% dplyr::select(blk, blkID)
+  
+  scdbx1b <- as.data.frame(scdbnonwd) %>% left_join(as.data.frame(scdbx1), by = "blk") %>% dplyr::select(SCOBJECTID, blk, blkID)
+  
+  
+  ### updated rstpts with blkID values
+  
+  rstpts <- rstpts %>% left_join(scdbx1b, by = "SCOBJECTID") %>% dplyr::select(SCOBJECTID, blk, blkID) %>% mutate(ptid = seq.int(nrow(.)))
+  
+  #### problem here is that the subcompartment entries here that don't correspond with component table will have NA values for blk and blkID entries......
+  
+  ### need to work out a way to assign ids - maybe I can just limit the points to the current raster extent and then just run the extract on this subset....
+  
+  #### no wait - the "scdb" dataset has got "blk" id values so there shouldn't be any NA instances here....
+  
+  
+  
+  
+  
+  
+  
+  
+  ### perform raster extract operation using these points and a raster version of FLS open habitat dataset cropped to the current scdb block boundary.
+  
+  ## Importing FLS open habitats polygon dataset
+  
+  opnhabs <- st_read("./Phase2/Open_habitats/FLS_habitasurvey_openhabitats_proper_V2.shp") %>% 
+    filter(lc_descrip %in% c("UPLAND HEATHLAND", "ACID GRASSLAND", "neutral grassland", "LOWLAND DRY ACID GRASSLAND", "MONTANE HEATH",
+                             "PURPLE MOOR-GRASS & RUSH PASTURE", "UPLAND CALCAREOUS GRASSLAND", "LOWLAND HEATHLAND", "LOWLAND MEADOW", "UPLAND HAY MEADOW",
+                             "DWARF SHRUB HEATH", "CALAMINARIAN GRASSLAND", "LOWLAND CALCAREOUS GRASSLAND", "CALCAREOUS GRASSLAND"))
+  
+  
+  #### opnhabs all - this dataset is used to remove all areas of overlap with LCM (we place priority on the habitat survey ground data over the LCM)
+  
+  opnhabsall <- st_read("./Phase2/Open_habitats/FLS_habitasurvey_openhabitats_proper_V2.shp") 
+  
+  
+  # * Function to calculate open area proportion ----
+  
+  opnhabfunc2 <- function(scdbx1,d, scax, opnhabs, scdbptsx, lcmx2, nfiropn, nfirwd){
+    
+    print(paste0("Loop: ", d))
+    
+    scdbx <- scdbx1[scdbx1$blkID == d,]
+    
+    scdbptsx2 <- scdbptsx %>% filter(blkID == d) %>% 
+      as("Spatial") %>% as.data.frame() %>% rename(X = coords.x1, Y = coords.x2)
+    
+    ### Filter open habitats layer to create separate grassland and grassland/mosaic subsets
+    
+    grasshab <- opnhabs %>% filter(lc_descrip %in% c("ACID GRASSLAND", "neutral grassland", "LOWLAND DRY ACID GRASSLAND",
+                                                     "PURPLE MOOR-GRASS & RUSH PASTURE", "UPLAND CALCAREOUS GRASSLAND", "LOWLAND MEADOW", "UPLAND HAY MEADOW",
+                                                      "CALAMINARIAN GRASSLAND", "LOWLAND CALCAREOUS GRASSLAND", "CALCAREOUS GRASSLAND"))
+    
+    
+    grassmos <- opnhabs %>% filter(lc_descrip %in% c("UPLAND HEATHLAND", "ACID GRASSLAND", "neutral grassland", "LOWLAND DRY ACID GRASSLAND", "MONTANE HEATH",
+                  "PURPLE MOOR-GRASS & RUSH PASTURE", "UPLAND CALCAREOUS GRASSLAND", "LOWLAND HEATHLAND", "LOWLAND MEADOW", "UPLAND HAY MEADOW",
+                  "DWARF SHRUB HEATH", "CALAMINARIAN GRASSLAND", "LOWLAND CALCAREOUS GRASSLAND", "CALCAREOUS GRASSLAND"))
+    
+    
+    ### third dataset to be 
+    
+    # ** Rasterize open habitat polygons to 25m resolution raster ----
+    
+    grassr <- fasterize(grasshab, disaggregate(crop(scax, scdbx), fact=10))
+    
+    grassmosr <- fasterize(grassmos, disaggregate(crop(scax, scdbx), fact=10))
+    
+    # ** Crop 100m agg raster by current woodland block polygon ----
+    scagg100mc <- disaggregate(crop(scax, scdbx), fact=10)
+    
+    #### Need to fill in gaps using lcm2019 dataset
+    
+    ### Need separate grassland vs grass-mosaic lcm subsets
+    
+    ### reclassify lcmx raster - grassland types
+    
+    lcmx3 <- crop(lcmx2, scdbx) %>% disaggregate(fact=4)
+    lcmx3[lcmx3 == 1] <- NA
+    lcmx3[lcmx3 %in% c(5,6,7)] <- 1
+    lcmx3[lcmx3 !=1] <- NA
+    
+    
+    ### reclassify lcmx raster - grassland/mosaic types
+    
+    lcmx4 <- crop(lcmx2, scdbx) %>% disaggregate(fact=4)
+    lcmx4[lcmx4 == 1] <- NA
+    lcmx4[lcmx4 %in% c(5,6,7, 9,10)] <- 1
+    lcmx4[lcmx4 !=1] <- NA
+    
+    
+    #### update opnr raster with lcm semi-natural open habitat areas
+    
+    nfirx <- nfiropn %>% crop(scdbx) %>% disaggregate(fact=10)
+    nfirx[nfirx > 0] <- 9999
+    
+    ### Update opnr raster with NFI woodland data
+    
+    nfiry <- crop(nfirwd, scdbx) %>% disaggregate(fact=10)
+    nfiry[nfiry > 0] <- 9999
+    
+    
+    
+    ### Convert all areas of overlap between NFI non semi-natural habitat and LCM to NA
+    
+    
+    ### Grassland only areas ----
+    
+    opgrassr <- raster::merge(nfiry, grassr, nfirx, lcmx3) %>% crop(scdbx)
+    opgrassr[opgrassr == 9999] <- NA
+    
+    opgrassr <- projectRaster(opgrassr, scagg100mc)
+    opgrassr[opgrassr>0] <- 1
+    
+    if(cellStats(opgrassr, 'sum') == 0){
+      
+      print("no open habitat data detected for current blkid")
+      
+      return()
+    }
+    
+    ### Raster extract operation
+    
+    opnext <- data.frame(ptid = scdbptsx2$ptid, openv = raster::extract(mask(opgrassr, scagg100mc), dplyr::select(scdbptsx2, c("X", "Y"))))
+    
+    #### aggregate across sub-compartments
+    
+    dfx <- scdbptsx2 %>% left_join(opnext, by = "ptid") %>% mutate(grassv = ifelse(is.na(openv), 0, openv))
+
+    
+    dfx2 <- dfx %>% group_by(SCOBJECTID) %>% summarise(blkID = first(blkID), grassvsum = sum(grassv), count = n()) %>% 
+      mutate(grass_prop = grassvsum/count)
+    
+    
+    
+    
+    ### Grassland mosaic areas ----
+    
+    opgrassmr <- raster::merge(nfiry, grassmosr, nfirx, lcmx4) %>% crop(scdbx)
+    opgrassmr[opgrassmr == 9999] <- NA
+    
+    opgrassmr <- projectRaster(opgrassmr, scagg100mc)
+    opgrassmr[opgrassmr>0] <- 1
+    
+    if(cellStats(opgrassmr, 'sum') == 0){
+      
+      print("no open habitat data detected for current blkid")
+      
+      return()
+    }
+    
+    ### Raster extract operation
+    
+    opnext <- data.frame(ptid = scdbptsx2$ptid, openv = raster::extract(mask(opgrassmr, scagg100mc), dplyr::select(scdbptsx2, c("X", "Y"))))
+    
+    #### aggregate across sub-compartments
+    
+    dfxm <- scdbptsx2 %>% left_join(opnext, by = "ptid") %>% mutate(grassmv = ifelse(is.na(openv), 0, openv))
+    
+    dfxm2 <- dfxm %>% group_by(SCOBJECTID) %>% summarise(blkID = first(blkID), grassmvsum = sum(grassmv), count = n()) %>% 
+      mutate(grassm_prop = grassmvsum/count) %>% 
+      dplyr::select(c(SCOBJECTID, grassm_prop))
+    
+
+    dfin <- dfx2 %>% left_join(dfxm2, by = "SCOBJECTID")
+
+    return(dfin)
+    
+  }
+  
+  
+  ### need to construct rasterised version of all sub-compartments in current FLS region
+  
+  scdbr <- fasterize(st_cast(scdbx1, "MULTIPOLYGON"), atdis, field = "blkID")
+  
+  fls <- st_read("./FLS_districts2.shp") %>% 
+    group_by(Region_1) %>% summarise(count=n()) %>% 
+    mutate(area = st_area(.)/10000) %>% 
+    mutate(flsid = seq.int(nrow(.)))
+  
+  fls2 <- fls %>% 
+    filter(flsid == as.numeric(x))
+  
+  scax <- scdbr %>% 
+    crop(fls2)
+  
+  ### Import lcm scotland raster and crop to current region
+  
+  lcmx <- raster("./LCM2019/LCM2019_Scotland.tif") %>% crop(fls2)
+  
+  #### update lcmx feature by masking out all areas of overlap with the habitat survey data
+  
+  opnallr <- fasterize(opnhabsall, aggregate(disaggregate(crop(scax, scdbx1), fact=5), fact=2)) %>% crop(fls2)
+  opnallr[opnallr>0] <- 9999
+  
+  lcmx2 <- merge(opnallr, lcmx)
+  lcmx2[lcmx2 == 9999] <- NA
+  
+  
+  ### incorporate NFI data here - rasterize then burn into opnr raster dataset and replace all values with NA
+  ### Should remove any areas mistakenly classified as semi-natural in the opnr dataset
+  
+  ### first import the NFI dataset and filter to keep only the non semi-natural habitats/features.
+  
+  nfi <- st_read("./NFI_woodland_Scotland2018.shp")
+  
+  ### NFI open habitat types only - of these select for only non-semi-natural types.
+  
+  nfiopn <- nfi %>% 
+    filter(CATEGORY %in% "Non woodland") %>% 
+    filter(!IFT_IOA %in% c("Other vegetation", "Grassland", "River", "Open water", "Bare area")) %>% 
+    mutate(id = seq.int(nrow(.))) %>% mutate(rastval = 1)
+  
+  ### NFI woodland types only
+  
+  nfiwd <- nfi %>% filter(CATEGORY %in% "Woodland") %>% mutate(id = seq.int(nrow(.)), rastval = 1)
+  
+  ### rasterize
+  
+  nfiropn <- fasterize(nfiopn, atdis, field = "rastval") %>% crop(fls2)
+  
+  nfirwd <- fasterize(nfiwd, atdis, field = "rastval") %>% crop(fls2)
+  
+  
+  #### Open habitat function
+  
+  opnout <- mapply(opnhabfunc2, list(scdbx1), as.list(sort(unique(scdbx1$blkID))), list(scax), list(opnhabs), list(rstpts), list(lcmx2), list(nfiropn), 
+                   list(nfirwd), SIMPLIFY = FALSE)
+  
+  
+  #### combine results
+  
+  dfinal <- plyr::compact(opnout)
+  
+  dfinal <- do.call(rbind, dfinal) %>% mutate(Grassland = ifelse(grass_prop >= 0.6, 1, 0), Grassland_mos = ifelse(grassm_prop >= 0.6, 1, 0))
+
+  return(dfinal)
+  
+}
+
+
+```
+
+## Stage 3.12 - Assigning woodland types to open structure types ----
+
+Up to this point we haven't assigned a woodland type to any of the sub-compartment stands with open-based structure types.  To address this we assigned each one of the stands in this subset the woodland type of the woodland stand which most overlaps with that open area.  To do this we first rasterised the woodland stands using woodland type as the raster field value.  Next we aggregated this raster to effectively extend the raster coverage across these open stands.  Next we ran a raster extract operation to extract the woodland type values from the aggregated raster to each of the open-based stands.  
+
+
+```{r echo = T, eval = F}
+
+## Assigning woodland types to open polygons ----
+  
+  #### Import woodland types dataset
+  
+  wdtypes <- readRDS(paste0("./Results/Region_", a, "/wdtypes.RData"))[[1]] %>% dplyr::select(SCOBJECTID, prim_code) %>% 
+    group_by(SCOBJECTID) %>% summarise(prim_code = first(prim_code))
+  
+  scdbmicrofin2 <- scdbmicrofin2 %>% left_join(wdtypes, by = "SCOBJECTID")
+
+  ## Additional stage - assigning proximate woodland types to open patches ----
+  
+  ## This will address the missing woodland type data for the open stands with permanent open and temporary open structure classes.
+  
+  # isolate subset that comprises of truly open polygons - those without a woodland type classification
+  
+  scdbopen <- scdbmicrofin2 %>% filter(is.na(prim_code))
+  
+  #### use list of distinct SCOBJECTID id values to generate subset of scdballpts dataset
+  
+  scdballpts2 <- scdballpts %>% inner_join(data.frame(SCOBJECTID = unique(scdbopen$SCOBJECTID)), by = "SCOBJECTID") #%>% 
+  
+  wdtypeslist <- wdtypes %>% group_by(prim_code) %>% summarise(count=n()) %>% dplyr::select(-c(count)) %>% 
+    mutate(id = seq.int(nrow(.)))
+  
+  scdbwds <- scdb %>% left_join(wdtypes, by = "SCOBJECTID") %>% left_join(wdtypeslist, by = "prim_code") %>% 
+    st_cast("MULTIPOLYGON")
+  
+  ### Aggregate woodland type dataset raster to 200m cell size
+  
+  scdbr <- fasterize(scdbwds, atdis, field = "id") %>% aggregate(fact=4, fun = "modal")
+  
+  
+  openext <- data.frame(SCOBJECTID = scdballpts2$SCOBJECTID, wdtype = raster::extract(scdbr, dplyr::select(scdballpts2, c("x", "y")))) %>% 
+    filter(!is.na(wdtype)) %>% 
+    group_by(SCOBJECTID, wdtype) %>% mutate(sum = n()) %>% ungroup() %>% 
+    group_by(SCOBJECTID) %>% mutate(rank = rank(-sum, ties.method = "first")) %>% ungroup() %>% 
+    filter(rank == 1) %>% rename(id = wdtype) %>% left_join(wdtypeslist, by = "id") %>% 
+    rename(prim_code_op = prim_code) %>% dplyr::select(SCOBJECTID, prim_code_op)
+
+  scdbmicrofin3 <- scdbmicrofin2 %>% left_join(openext, by = "SCOBJECTID") %>% mutate(prim_code = ifelse(!is.na(prim_code_op), prim_code_op, prim_code)) %>% 
+    dplyr::select(-c(prim_code_op))
+  
+  saveRDS(scdbmicrofin3, paste0("./Phase2/Results/Region_", a, "/scdbmicrofin3.RData"))
+
+
+
+
+
+```
+
+
+## Stage 3.13 - Assigning deadwood status to open structure types ----
+
+A similar problem to that covered in stage 3.12 is the lack of deadwood assigned to open-structure stands.  This was a simple task to fix for the temporary open stands as they were derived originally from areas of clear-fell and as clear is interpreted as a form of deadwood, all stands of temporary open were assigned the deadwood classification.
+
+For permanent-open stands we used a method similar to that used in stage 3.12 where we assigned deadwood microhabitat to any of these areas if they overlapped or abutted woodland stands which also had the deadwood microhabitat assigned.
+
+```{r echo = T, eval = F}
+
+
+## Assigning deadwood microhabitat to open structure type polygons ----
+  
+  ## * Temporary open stands ----
+  ### Merely assiggn deadwood to all temporary open stands
+  
+  ## import latest dominant structures dataset
+  
+  struc <- as.data.frame(st_read(paste0("./Results/Region_", a, "/Dominant_structuretypes_v5.shp"))) %>% dplyr::select(c(SCOBJECTID, strt_cls))
+  
+  scdbmicrofin3 <- scdbmicrofin3 %>% left_join(struc, by = "SCOBJECTID") %>% mutate(deadwood = ifelse(strt_cls %in% c("temp_opn"), 1, deadwood))
+  
+  
+  
+  ## * Permanent open stands ----
+  
+  deadr <- scdbmicrofin3 %>% 
+    st_cast("MULTIPOLYGON")
+  
+  ### Aggregate woodland type dataset raster to 200m cell size
+  
+  scdbr <- fasterize(deadr, atdis, field = "deadwood") %>% aggregate(fact=4, fun = "modal")
+  
+  scdbopen <- scdbmicrofin3 %>% filter(strt_cls %in% c("perm_opn"))
+  
+  #### use list of distinct SCOBJECTID id values to generate subset of scdballpts dataset
+  
+  scdballpts2 <- scdballpts %>% inner_join(data.frame(SCOBJECTID = unique(scdbopen$SCOBJECTID)), by = "SCOBJECTID")
+  
+  permdead <- data.frame(SCOBJECTID = scdballpts2$SCOBJECTID, deadv = raster::extract(scdbr, dplyr::select(scdballpts2, c("x", "y")))) %>% 
+    mutate(deadv = ifelse(is.na(deadv), 0, deadv)) %>% 
+    group_by(SCOBJECTID) %>% summarise(count = n(), freq = sum(deadv)) %>% 
+    mutate(dprop = freq/count) %>% dplyr::select(SCOBJECTID,dprop) %>% 
+    filter(dprop > 0.25)
+  
+  scdbmicrofin3 <- scdbmicrofin3 %>% left_join(permdead, by = "SCOBJECTID") %>% 
+    mutate(deadwood = ifelse(!is.na(dprop), 1, deadwood)) %>% 
+    dplyr::select(-c(dprop, strt_cls))
+
+
+
+
+```
+
+
+
+
+
+
